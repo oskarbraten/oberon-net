@@ -1,47 +1,62 @@
 use std::thread;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+use std::io::Result;
 use std::net::{UdpSocket, SocketAddr};
+
+const VERSION_MAJOR: &'static str = env!("CARGO_PKG_VERSION_MAJOR");
+const VERSION_MINOR: &'static str = env!("CARGO_PKG_VERSION_MINOR");
+const VERSION_PATCH: &'static str = env!("CARGO_PKG_VERSION_PATCH");
+
+#[macro_use]
+extern crate lazy_static;
+
+lazy_static! {
+    static ref VERSION: (u8, u8, u8) = (VERSION_MAJOR.parse().unwrap(), VERSION_MINOR.parse().unwrap(), VERSION_PATCH.parse().unwrap());
+}
 
 use chashmap::CHashMap;
 use crossbeam::channel;
 
 mod config;
-use config::Config;
+pub use config::Config;
 
 mod event;
 pub use event::Event;
 
-mod datagram;
-use datagram::Datagram;
-
 mod packet;
 pub use packet::Packet;
+
+mod datagram;
+use datagram::Datagram;
 
 mod connection;
 use connection::Connection;
 
 #[derive(Debug, Clone)]
 pub struct Socket {
+    local_address: SocketAddr,
     sender: channel::Sender<Packet>,
     receiver: channel::Receiver<Event>
 }
 
 impl Socket {
-    pub fn bind_any(config: Config) -> Self {
+    pub fn bind_any(config: Config) -> Result<Self> {
         Self::bind("0.0.0.0:0".parse().unwrap(), config)
     }
 
-    pub fn bind(address: SocketAddr, config: Config) -> Self {
+    pub fn bind(address: SocketAddr, config: Config) -> Result<Self> {
         let connections: Arc<CHashMap<SocketAddr, Connection>> = Arc::new(CHashMap::new());
 
         let (outbound_sender, outbound_receiver) = channel::unbounded::<Packet>();
         let (inbound_sender, inbound_receiver) = channel::bounded::<Event>(config.event_capacity);
 
-        let socket = UdpSocket::bind(address).expect("Unable to bind UDP-socket.");
+        let socket = UdpSocket::bind(address)?;
+        let local_address = socket.local_addr()?;
 
+        // Reader thread:
         {
-            let socket = socket.try_clone().expect("Unable to clone UDP-socket.");
+            let socket = socket.try_clone()?;
             let inbound_sender = inbound_sender.clone();
             let connections = connections.clone();
             thread::spawn(move || {
@@ -52,7 +67,11 @@ impl Socket {
                     match socket.recv_from(&mut buffer) {
                         Ok((bytes_read, address)) => {
                             match bincode::deserialize::<Datagram>(&buffer[..bytes_read]) {
-                                Ok(Datagram { payload, rtt_seq, rtt_ack }) => {
+                                Ok(Datagram { version, payload, rtt_seq, rtt_ack }) => {
+                                    if version != *VERSION {
+                                        continue; // Protocol version does not match, just discard it.
+                                    }
+
                                     connections.alter(address.clone(), |conn| {
                                         let mut connection = match conn {
                                             Some(mut connection) => {
@@ -68,8 +87,6 @@ impl Socket {
                                             }
                                         };
 
-                                        println!("RTT seq: {}, ack: {}", rtt_seq, rtt_ack);
-
                                         if let Some(instant) = connection.rtt_timers.remove(&rtt_ack) {
                                             let rtt_sample = instant.elapsed();
 
@@ -81,17 +98,17 @@ impl Socket {
                                                     connection.rtt = Some(rtt_sample);
                                                 }
                                             }
-
-                                            println!("Estimated RTT: {} ms", connection.rtt.unwrap().as_millis());
                                         }
 
                                         connection.rtt_seq_remote = rtt_seq;
-                                        inbound_sender.send(Event::Received(address, payload)).expect("Unable to dispatch event to channel.");
+                                        inbound_sender.send(Event::Received(address, payload, connection.rtt)).expect("Unable to dispatch event to channel.");
                                         
                                         Some(connection)
                                     });
                                 },
-                                Err(msg) => println!("Error parsing payload: {}", msg)
+                                Err(_) => {
+                                    // println!("Error parsing payload: {}", msg);
+                                }
                             }
                         },
                         Err(msg) => {
@@ -104,7 +121,7 @@ impl Socket {
 
         // Sender thread:
         {
-            let socket = socket.try_clone().expect("Unable to clone UDP-socket.");
+            let socket = socket.try_clone()?;
             let inbound_sender = inbound_sender.clone();
             let connections = connections.clone();
             thread::spawn(move || {
@@ -131,7 +148,7 @@ impl Socket {
                                     connection.rtt_timers.pop_front();
                                 }
 
-                                let buffer = bincode::serialize(&Datagram::new(payload, connection.rtt_seq_local, connection.rtt_seq_remote)).expect("Unable to serialize datagram.");
+                                let buffer = bincode::serialize(&Datagram::new(*VERSION, payload, connection.rtt_seq_local, connection.rtt_seq_remote)).expect("Unable to serialize datagram.");
                                 match socket.send_to(&buffer[0..], address) {
                                     Ok(_) => {},
                                     Err(msg) => println!("Error sending packet: {}", msg)
@@ -148,7 +165,7 @@ impl Socket {
             });
         }
 
-        // Timeout checker thread:
+        // Connection timeout checker thread:
         {
             let connections = connections.clone();
             let inbound_sender = inbound_sender.clone();
@@ -170,10 +187,15 @@ impl Socket {
             });
         }
         
-        Self {
+        Ok(Self {
+            local_address,
             sender: outbound_sender,
             receiver: inbound_receiver
-        }
+        })
+    }
+
+    pub fn local_address(&self) -> SocketAddr {
+        self.local_address
     }
 
     pub fn event_receiver(&self) -> channel::Receiver<Event> {
@@ -195,13 +217,14 @@ mod tests {
         let server_address: SocketAddr = "127.0.0.1:38000".parse().unwrap();
         let client_address: SocketAddr = "127.0.0.1:38001".parse().unwrap();
 
-        let server = Socket::bind(server_address, Config::default());
-        let client = Socket::bind(client_address, Config::default());
+        let server = Socket::bind(server_address, Config::default()).unwrap();
+        let client = Socket::bind(client_address, Config::default()).unwrap();
 
         let j1 = std::thread::spawn(move || {
-            for i in 0..10 {
-                server.packet_sender().send(Packet::new(client_address, "Hello, Client!".as_bytes().to_vec()));
-                std::thread::sleep_ms(50);
+            
+            for _ in 0..20 {
+                server.packet_sender().send(Packet::new(client_address, "Hello, Client!".as_bytes().to_vec())).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
             loop {
                 match server.event_receiver().recv() {
@@ -209,8 +232,8 @@ mod tests {
                         println!("Client connected to server!");
                         assert_eq!(addr, client_address);
                     },
-                    Ok(Event::Received(addr, payload)) => {
-                        println!("Server received a packet from the client! Content: {}", std::str::from_utf8(&payload).unwrap());
+                    Ok(Event::Received(addr, payload, rtt)) => {
+                        println!("Server received content: {}, estimated RTT: {} ms, has estimate: {}", std::str::from_utf8(&payload).unwrap(), rtt.unwrap_or_default().as_millis(), rtt.is_some());
                         assert_eq!(addr, client_address);
                         assert_eq!("Hello, Server!".as_bytes().to_vec(), payload);
                     },
@@ -227,9 +250,9 @@ mod tests {
         });
         
         let j2 = std::thread::spawn(move || {
-            for i in 0..10 {
-                client.packet_sender().send(Packet::new(server_address, "Hello, Server!".as_bytes().to_vec()));
-                std::thread::sleep_ms(50);
+            for _ in 0..20 {
+                client.packet_sender().send(Packet::new(server_address, "Hello, Server!".as_bytes().to_vec())).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
             loop {
                 match client.event_receiver().recv() {
@@ -237,8 +260,8 @@ mod tests {
                         println!("Server connected to client!");
                         assert_eq!(addr, server_address);
                     },
-                    Ok(Event::Received(addr, payload)) => {
-                        println!("Client received a packet from the server! Content: {}", std::str::from_utf8(&payload).unwrap());
+                    Ok(Event::Received(addr, payload, rtt)) => {
+                        println!("Client received content: {}, estimated RTT: {} ms, has estimate: {}", std::str::from_utf8(&payload).unwrap(), rtt.unwrap_or_default().as_millis(), rtt.is_some());
                         assert_eq!(addr, server_address);
                         assert_eq!("Hello, Client!".as_bytes().to_vec(), payload);
                     },

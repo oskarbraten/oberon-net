@@ -5,9 +5,9 @@ use linked_hash_map::LinkedHashMap;
 pub struct Connection {
     pub last_interaction: Instant,
     pub rtt: Option<Duration>,
-    pub rtt_timers: LinkedHashMap<u32, Instant>,
-    pub rtt_seq_local: u32,
-    pub rtt_seq_remote: u32
+    pub rtt_timers: LinkedHashMap<u16, Instant>,
+    pub rtt_seq_local: u16,
+    pub rtt_seq_remote: u16
 }
 
 impl Connection {
