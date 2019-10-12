@@ -41,10 +41,12 @@ pub struct Socket {
 }
 
 impl Socket {
+    /// Bind to any available port on the system.
     pub fn bind_any(config: Config) -> Result<Self> {
         Self::bind("0.0.0.0:0".parse().unwrap(), config)
     }
 
+    /// Bind to the specified address.
     pub fn bind(address: SocketAddr, config: Config) -> Result<Self> {
         let connections: Arc<CHashMap<SocketAddr, Connection>> = Arc::new(CHashMap::new());
 
@@ -66,12 +68,14 @@ impl Socket {
                     let mut buffer = [0; 1450];
                     match socket.recv_from(&mut buffer) {
                         Ok((bytes_read, address)) => {
-                            match bincode::deserialize::<Datagram>(&buffer[..bytes_read]) {
-                                Ok(Datagram { version, payload, rtt_seq, rtt_ack }) => {
-                                    if version != *VERSION {
-                                        continue; // Protocol version does not match, just discard it.
-                                    }
 
+                            let remote_version = (buffer[0], buffer[1], buffer[2]);
+                            if remote_version != *VERSION {
+                                continue; // Protocol version does not match, just discard it.
+                            }
+
+                            match bincode::deserialize::<Datagram>(&buffer[3..bytes_read]) {
+                                Ok(Datagram { payload, rtt_seq, rtt_ack }) => {
                                     connections.alter(address.clone(), |conn| {
                                         let mut connection = match conn {
                                             Some(mut connection) => {
@@ -108,6 +112,7 @@ impl Socket {
                                 },
                                 Err(_) => {
                                     // println!("Error parsing payload: {}", msg);
+                                    continue;
                                 }
                             }
                         },
@@ -148,7 +153,8 @@ impl Socket {
                                     connection.rtt_timers.pop_front();
                                 }
 
-                                let buffer = bincode::serialize(&Datagram::new(*VERSION, payload, connection.rtt_seq_local, connection.rtt_seq_remote)).expect("Unable to serialize datagram.");
+                                let mut buffer: Vec<u8> = vec![(*VERSION).0, (*VERSION).1, (*VERSION).2];
+                                bincode::serialize_into(&mut buffer, &Datagram::new(payload, connection.rtt_seq_local, connection.rtt_seq_remote)).expect("Unable to serialize datagram.");
                                 match socket.send_to(&buffer[0..], address) {
                                     Ok(_) => {},
                                     Err(msg) => println!("Error sending packet: {}", msg)
@@ -194,14 +200,19 @@ impl Socket {
         })
     }
 
+    /// Gets the local address of the socket.
     pub fn local_address(&self) -> SocketAddr {
         self.local_address
     }
 
+    /// Get a clone of the event receiver.
+    /// It is thread-safe, and is used to listen for events on the socket.
     pub fn event_receiver(&self) -> channel::Receiver<Event> {
         self.receiver.clone()
     }
 
+    /// Get a clone of the packet sender.
+    /// It is thread-safe, and is used to send packets.
     pub fn packet_sender(&self) -> channel::Sender<Packet> {
         self.sender.clone()
     }
