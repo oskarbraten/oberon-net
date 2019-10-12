@@ -12,7 +12,7 @@ Zelda does not provide any reliability and is instead developed to be used along
 
 ## Quick-start
 Zelda provides a struct called Socket which can be bound to an address:
-```
+```rust
 use std::net::SocketAddr;
 use crossbeam::channel::{Sender, Receiver};
 use zelda::{Socket, Config, Packet, Event};
@@ -44,7 +44,7 @@ while let Ok(event) = event_receiver.recv() {
 ```
 
 Another full example:
-```
+```rust
 let server_address: SocketAddr = "127.0.0.1:38000".parse().unwrap();
 let client_address: SocketAddr = "127.0.0.1:38001".parse().unwrap();
 
