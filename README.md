@@ -11,23 +11,22 @@ Zelda does not provide any reliability and is instead developed to be used along
 
 
 ## Quick-start
-Zelda provides a struct called Socket which can be bound to an address:
 ```rust
 use std::net::SocketAddr;
 use crossbeam::channel::{Sender, Receiver};
 use zelda::{Socket, Config, Packet, Event};
 
-let socket_1_address: SocketAddr = "127.0.0.1:38000".parse().unwrap();
+let socket_address: SocketAddr = "127.0.0.1:38000".parse().unwrap();
 
-let socket_1 = Socket::bind(, Config::default())?;
-let socket_2 = Socket::bind_any(Config::default())?;
+let socket1 = Socket::bind(socket_address, Config::default())?;
+let socket2 = Socket::bind_any(Config::default())?;
 
-println!("Address of socket 2: {}", socket_2.local_address());
+println!("Address of socket 2: {}", socket2.local_address());
 
-let packet_sender: Sender<Packet> = socket_2.packet_sender();
-packet_sender.send(Packet::new(socket_1_address, "Hello, Client!".as_bytes().to_vec()));
+let packet_sender: Sender<Packet> = socket2.packet_sender();
+packet_sender.send(Packet::new(socket_address, "Hello, Client!".as_bytes().to_vec()));
 
-let event_receiver: Receiver<Event> = socket_1.event_receiver();
+let event_receiver: Receiver<Event> = socket1.event_receiver();
 
 while let Ok(event) = event_receiver.recv() {
     Event::Connected(addr) => {
