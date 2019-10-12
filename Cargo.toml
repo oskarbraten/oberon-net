@@ -1,5 +1,5 @@
 [package]
-name = "oberon-net"
+name = "zelda"
 version = "0.1.0"
 authors = ["oskarbraten <oskar.braten@outlook.com>"]
 edition = "2018"
