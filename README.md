@@ -6,9 +6,9 @@ Zelda does not provide any reliability and is instead developed to be used along
 
 ## Features
  * [x] Virtual connections
- * [x] RTT estimation
  * [x] Thread-safe send/receive
-
+ * [x] RTT estimation
+ * [ ] Immediate ack support (RTT estimation)
 
 ## Quick-start
 ```rust
