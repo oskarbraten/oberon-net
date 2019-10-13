@@ -1,6 +1,6 @@
 use std::thread;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::io::Result;
 use std::net::{UdpSocket, SocketAddr};
 
@@ -75,7 +75,7 @@ impl Socket {
                             }
 
                             match bincode::deserialize::<Datagram>(&buffer[3..bytes_read]) {
-                                Ok(Datagram { payload, rtt_seq, rtt_ack }) => {
+                                Ok(Datagram { payload, rtt_seq, rtt_ack, rtt_offset }) => {
                                     connections.alter(address.clone(), |conn| {
                                         let mut connection = match conn {
                                             Some(mut connection) => {
@@ -91,21 +91,29 @@ impl Socket {
                                             }
                                         };
 
-                                        if let Some(instant) = connection.rtt_timers.remove(&rtt_ack) {
+                                        if let Some(instant) = connection.rtt_local_timers.remove(&rtt_ack) {
                                             let rtt_sample = instant.elapsed();
+                                            let rtt_corrected = rtt_sample.checked_sub(Duration::from_millis(rtt_offset as u64)).unwrap_or(Duration::from_millis(0));
 
                                             match connection.rtt {
                                                 Some(rtt) => {
-                                                    connection.rtt = Some((rtt.mul_f32(1.0 - config.rtt_alpha)) + rtt_sample.mul_f32(config.rtt_alpha));
+                                                    connection.rtt = Some((rtt.mul_f32(1.0 - config.rtt_alpha)) + rtt_corrected.mul_f32(config.rtt_alpha));
                                                 },
                                                 None => {
-                                                    connection.rtt = Some(rtt_sample);
+                                                    connection.rtt = Some(rtt_corrected);
                                                 }
                                             }
                                         }
 
-                                        connection.rtt_seq_remote = rtt_seq;
-                                        inbound_sender.send(Event::Received(address, payload, connection.rtt)).expect("Unable to dispatch event to channel.");
+                                        connection.rtt_remote_seq = rtt_seq;
+                                        connection.rtt_remote_timer = Instant::now();
+
+                                        inbound_sender.send(Event::Received {
+                                            address,
+                                            payload,
+                                            rtt: connection.rtt,
+                                            rtt_offset: connection.rtt.and(Some(Duration::from_millis(rtt_offset as u64)))
+                                        }).expect("Unable to dispatch event to channel.");
                                         
                                         Some(connection)
                                     });
@@ -145,16 +153,18 @@ impl Socket {
                                     }
                                 };
 
-                                connection.rtt_seq_local = connection.rtt_seq_local.wrapping_add(1);
-                                connection.rtt_timers.insert(connection.rtt_seq_local, Instant::now());
+                                connection.rtt_local_seq = connection.rtt_local_seq.wrapping_add(1);
+                                connection.rtt_local_timers.insert(connection.rtt_local_seq, Instant::now());
 
                                 // Trim queue:
-                                while connection.rtt_timers.len() > config.rtt_queue_capacity {
-                                    connection.rtt_timers.pop_front();
+                                while connection.rtt_local_timers.len() > config.rtt_queue_capacity {
+                                    connection.rtt_local_timers.pop_front();
                                 }
 
+                                let rtt_offset = connection.rtt_remote_timer.elapsed().as_millis().min(std::u16::MAX as u128) as u16;
+
                                 let mut buffer: Vec<u8> = vec![(*VERSION).0, (*VERSION).1, (*VERSION).2];
-                                bincode::serialize_into(&mut buffer, &Datagram::new(payload, connection.rtt_seq_local, connection.rtt_seq_remote)).expect("Unable to serialize datagram.");
+                                bincode::serialize_into(&mut buffer, &Datagram::new(payload, connection.rtt_local_seq, connection.rtt_remote_seq, rtt_offset)).expect("Unable to serialize datagram.");
                                 match socket.send_to(&buffer[0..], address) {
                                     Ok(_) => {},
                                     Err(msg) => println!("Error sending packet: {}", msg)
@@ -232,7 +242,7 @@ mod tests {
         let client = Socket::bind(client_address, Config::default()).unwrap();
 
         let j1 = std::thread::spawn(move || {
-            
+            std::thread::sleep(std::time::Duration::from_millis(5));
             for _ in 0..20 {
                 server.packet_sender().send(Packet::new(client_address, "Hello, Client!".as_bytes().to_vec())).unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -243,9 +253,9 @@ mod tests {
                         println!("Client connected to server!");
                         assert_eq!(addr, client_address);
                     },
-                    Ok(Event::Received(addr, payload, rtt)) => {
-                        println!("Server received content: {}, estimated RTT: {} ms, has estimate: {}", std::str::from_utf8(&payload).unwrap(), rtt.unwrap_or_default().as_millis(), rtt.is_some());
-                        assert_eq!(addr, client_address);
+                    Ok(Event::Received { address, payload, rtt, rtt_offset }) => {
+                        println!("Server received content: {}, estimated RTT: {} ms, offset: {} ms, has estimate: {}", std::str::from_utf8(&payload).unwrap(), rtt.unwrap_or_default().as_millis(), rtt_offset.unwrap_or_default().as_millis(), rtt.is_some());
+                        assert_eq!(address, client_address);
                         assert_eq!("Hello, Server!".as_bytes().to_vec(), payload);
                     },
                     Ok(Event::Disconnected(addr)) => {
@@ -271,9 +281,9 @@ mod tests {
                         println!("Server connected to client!");
                         assert_eq!(addr, server_address);
                     },
-                    Ok(Event::Received(addr, payload, rtt)) => {
-                        println!("Client received content: {}, estimated RTT: {} ms, has estimate: {}", std::str::from_utf8(&payload).unwrap(), rtt.unwrap_or_default().as_millis(), rtt.is_some());
-                        assert_eq!(addr, server_address);
+                    Ok(Event::Received { address, payload, rtt, rtt_offset }) => {
+                        println!("Client received content: {}, estimated RTT: {} ms, offset: {} ms, has estimate: {}", std::str::from_utf8(&payload).unwrap(), rtt.unwrap_or_default().as_millis(), rtt_offset.unwrap_or_default().as_millis(), rtt.is_some());
+                        assert_eq!(address, server_address);
                         assert_eq!("Hello, Client!".as_bytes().to_vec(), payload);
                     },
                     Ok(Event::Disconnected(addr)) => {
