@@ -8,6 +8,7 @@ license = "MIT"
 authors = ["oskarbraten <oskar.braten@outlook.com>"]
 readme = "README.md"
 documentation = "https://docs.rs/zelda"
+repository = "https://github.com/oskarbraten/zelda"
 edition = "2018"
 
 [dependencies]
