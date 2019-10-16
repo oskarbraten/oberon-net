@@ -2,7 +2,7 @@
 
 Zelda is a lightweight application-level network protocol for use in real-time applications. It is built on UDP and provides lightweight virtual connections and estimation of Round-trip time. The API is inspired by [laminar](https://github.com/amethyst/laminar).
 
-Zelda does not provide any reliability and is instead developed to be used alongside other reliable protocols (for example TCP).
+Zelda does not provide any reliability and is instead developed to be used alongside other reliable protocols (for example TCP) or with a reliability layer on top.
 
 ## Features
  * [x] Virtual connections
