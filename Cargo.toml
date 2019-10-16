@@ -3,7 +3,7 @@ name = "zelda"
 description = """
 Zelda is a lightweight application-level network protocol for use in real-time applications.
 """
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT"
 authors = ["oskarbraten <oskar.braten@outlook.com>"]
 readme = "README.md"
