@@ -7,29 +7,38 @@
 //! use crossbeam::channel::{Sender, Receiver};
 //! use zelda::{Socket, Config, Packet, Event};
 //! 
-//! let socket_address: SocketAddr = "127.0.0.1:38000".parse().unwrap();
+//! fn main() -> Result<(), std::io::Error> {
 //! 
-//! let socket1 = Socket::bind(socket_address, Config::default())?;
-//! let socket2 = Socket::bind_any(Config::default())?;
-//! 
-//! println!("Address of socket 2: {}", socket2.local_address());
-//! 
-//! let packet_sender: Sender<Packet> = socket2.packet_sender();
-//! packet_sender.send(Packet::new(socket_address, "Hello, Client!".as_bytes().to_vec()));
-//! 
-//! let event_receiver: Receiver<Event> = socket1.event_receiver();
-//! 
-//! while let Ok(event) = event_receiver.recv() {
-//!     Event::Connected(addr) => {
-//!         // A connection was established with addr.
-//!     },
-//!     Event::Received { address, payload, rtt, rtt_offset } => {
-//!         // Received payload on addr with estimated rtt.
-//!     },
-//!     Event::Disconnected(addr) => {
-//!         // Client with addr disconnected.
-//!         break;
+//!     let socket_address: SocketAddr = "127.0.0.1:38000".parse().unwrap();
+//!     
+//!     let socket1 = Socket::bind(socket_address, Config::default())?;
+//!     let socket2 = Socket::bind_any(Config::default())?;
+//!     
+//!     println!("Address of socket 2: {}", socket2.local_address());
+//!     
+//!     let packet_sender: Sender<Packet> = socket2.packet_sender();
+//!     packet_sender.send(Packet::new(socket_address, "Hello, Client!".as_bytes().to_vec()));
+//!     
+//!     let event_receiver: Receiver<Event> = socket1.event_receiver();
+//!     
+//!     while let Ok(event) = event_receiver.recv() {
+//!         match event {
+//!             Event::Connected(addr) => {
+//!                 // A connection was established with addr.
+//!             },
+//!             Event::Received { address, payload, rtt, rtt_offset } => {
+//!                 // Received payload on addr with estimated rtt.
+//!                 println!("Received payload: {}", std::str::from_utf8(&payload).unwrap());
+//!             },
+//!             Event::Disconnected(addr) => {
+//!                 // Client with addr disconnected.
+//!                 break;
+//!             }
+//!         }
 //!     }
+//! 
+//!     Ok(())
+//! 
 //! }
 //! ```
 //! 
@@ -54,6 +63,8 @@ lazy_static! {
 
 use chashmap::CHashMap;
 use crossbeam::channel;
+
+mod collections;
 
 mod config;
 pub use config::Config;
@@ -121,35 +132,35 @@ impl Socket {
                                                 connection
                                             },
                                             None => {
-                                                let connection = Connection::new();
+                                                let connection = Connection::new(config.rtt_buffer_size);
                                                 inbound_sender.send(Event::Connected(address)).expect("Unable to dispatch event to channel.");
 
                                                 connection
                                             }
                                         };
 
-                                        if let Some(instant) = connection.rtt_local_timers.remove(&rtt_ack) {
+                                        if let Some(instant) = connection.rtt.timers.remove(&rtt_ack) {
                                             let rtt_sample = instant.elapsed();
                                             let rtt_corrected = rtt_sample.checked_sub(Duration::from_millis(rtt_offset as u64)).unwrap_or(Duration::from_millis(0));
 
-                                            match connection.rtt {
+                                            match connection.rtt.current {
                                                 Some(rtt) => {
-                                                    connection.rtt = Some((rtt.mul_f32(1.0 - config.rtt_alpha)) + rtt_corrected.mul_f32(config.rtt_alpha));
+                                                    connection.rtt.current = Some((rtt.mul_f32(1.0 - config.rtt_alpha)) + rtt_corrected.mul_f32(config.rtt_alpha));
                                                 },
                                                 None => {
-                                                    connection.rtt = Some(rtt_corrected);
+                                                    connection.rtt.current = Some(rtt_corrected);
                                                 }
                                             }
                                         }
 
-                                        connection.rtt_remote_seq = rtt_seq;
-                                        connection.rtt_remote_timer = Instant::now();
+                                        connection.rtt.remote_seq = rtt_seq;
+                                        connection.rtt.remote_timer = Instant::now();
 
                                         inbound_sender.send(Event::Received {
                                             address,
                                             payload,
-                                            rtt: connection.rtt,
-                                            rtt_offset: connection.rtt.and(Some(Duration::from_millis(rtt_offset as u64)))
+                                            rtt: connection.rtt.current,
+                                            rtt_offset: connection.rtt.current.and(Some(Duration::from_millis(rtt_offset as u64)))
                                         }).expect("Unable to dispatch event to channel.");
                                         
                                         Some(connection)
@@ -183,25 +194,18 @@ impl Socket {
                                 let mut connection = match conn {
                                     Some(connection) => connection,
                                     None => {
-                                        let connection = Connection::new();
+                                        let connection = Connection::new(config.rtt_buffer_size);
                                         inbound_sender.send(Event::Connected(address)).expect("Unable to dispatch event to channel.");
 
                                         connection
                                     }
                                 };
 
-                                connection.rtt_local_seq = connection.rtt_local_seq.wrapping_add(1);
-                                connection.rtt_local_timers.insert(connection.rtt_local_seq, Instant::now());
-
-                                // Trim queue:
-                                while connection.rtt_local_timers.len() > config.rtt_queue_capacity {
-                                    connection.rtt_local_timers.pop_front();
-                                }
-
-                                let rtt_offset = connection.rtt_remote_timer.elapsed().as_millis().min(std::u16::MAX as u128) as u16;
+                                let seq = connection.rtt.timers.insert(Instant::now());
+                                let rtt_offset = connection.rtt.remote_timer.elapsed().as_millis().min(std::u16::MAX as u128) as u16;
 
                                 let mut buffer: Vec<u8> = vec![(*VERSION).0, (*VERSION).1, (*VERSION).2];
-                                bincode::serialize_into(&mut buffer, &Datagram::new(payload, connection.rtt_local_seq, connection.rtt_remote_seq, rtt_offset)).expect("Unable to serialize datagram.");
+                                bincode::serialize_into(&mut buffer, &Datagram::new(payload, seq, connection.rtt.remote_seq, rtt_offset)).expect("Unable to serialize datagram.");
                                 match socket.send_to(&buffer[0..], address) {
                                     Ok(_) => {},
                                     Err(msg) => println!("Error sending packet: {}", msg)
@@ -279,10 +283,9 @@ mod tests {
         let client = Socket::bind(client_address, Config::default()).unwrap();
 
         let j1 = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            for _ in 0..20 {
+            for _ in 0..10 {
                 server.packet_sender().send(Packet::new(client_address, "Hello, Client!".as_bytes().to_vec())).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
             loop {
                 match server.event_receiver().recv() {
@@ -296,7 +299,7 @@ mod tests {
                         assert_eq!("Hello, Server!".as_bytes().to_vec(), payload);
                     },
                     Ok(Event::Disconnected(addr)) => {
-                        println!("Client disconnnected from server!");
+                        println!("Client disconnected from server!");
                         assert_eq!(addr, client_address);
                         break;
                     },
@@ -308,10 +311,6 @@ mod tests {
         });
         
         let j2 = std::thread::spawn(move || {
-            for _ in 0..20 {
-                client.packet_sender().send(Packet::new(server_address, "Hello, Server!".as_bytes().to_vec())).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
             loop {
                 match client.event_receiver().recv() {
                     Ok(Event::Connected(addr)) => {
@@ -322,6 +321,8 @@ mod tests {
                         println!("Client received content: {}, estimated RTT: {} ms, offset: {} ms, has estimate: {}", std::str::from_utf8(&payload).unwrap(), rtt.unwrap_or_default().as_millis(), rtt_offset.unwrap_or_default().as_millis(), rtt.is_some());
                         assert_eq!(address, server_address);
                         assert_eq!("Hello, Client!".as_bytes().to_vec(), payload);
+
+                        client.packet_sender().send(Packet::new(server_address, "Hello, Server!".as_bytes().to_vec())).unwrap();
                     },
                     Ok(Event::Disconnected(addr)) => {
                         println!("Server disconnnected from client!");

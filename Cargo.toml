@@ -3,7 +3,7 @@ name = "zelda"
 description = """
 Zelda is a lightweight application-level network protocol for use in real-time applications.
 """
-version = "0.1.1"
+version = "0.1.2"
 license = "MIT"
 authors = ["oskarbraten <oskar.braten@outlook.com>"]
 readme = "README.md"
@@ -12,9 +12,9 @@ repository = "https://github.com/oskarbraten/zelda"
 edition = "2018"
 
 [dependencies]
+num-traits = "0.2"
 lazy_static = "1.4.0"
 crossbeam = "0.7.2"
 chashmap = "2.2.2"
-linked-hash-map = "0.5.2"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.2.0"
