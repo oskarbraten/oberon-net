@@ -1,8 +1,6 @@
 [package]
 name = "zelda"
-description = """
-Zelda is a lightweight application-level network protocol for use in real-time applications.
-"""
+description = "Zelda, a lightweight application-level network protocol for use in real-time applications."
 version = "0.1.2"
 license = "MIT"
 authors = ["oskarbraten <oskar.braten@outlook.com>"]
