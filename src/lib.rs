@@ -50,23 +50,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const VERSION_MAJOR: &'static str = env!("CARGO_PKG_VERSION_MAJOR");
-const VERSION_MINOR: &'static str = env!("CARGO_PKG_VERSION_MINOR");
-const VERSION_PATCH: &'static str = env!("CARGO_PKG_VERSION_PATCH");
-
-#[macro_use]
-extern crate lazy_static;
-
-lazy_static! {
-    static ref VERSION: (u8, u8, u8) = (
-        VERSION_MAJOR.parse().unwrap(),
-        VERSION_MINOR.parse().unwrap(),
-        VERSION_PATCH.parse().unwrap()
-    );
-}
-
-use chashmap::CHashMap;
 use crossbeam::channel;
+use dashmap::DashMap;
 
 mod collections;
 
@@ -119,7 +104,7 @@ impl Socket {
     }
 
     pub fn bind_with(socket: UdpSocket, config: Config) -> Result<Self> {
-        let connections: Arc<CHashMap<SocketAddr, Connection>> = Arc::new(CHashMap::new());
+        let connections: Arc<DashMap<SocketAddr, Connection>> = Arc::new(DashMap::new());
 
         let (outbound_sender, outbound_receiver) = channel::unbounded::<Packet>();
         let (inbound_sender, inbound_receiver) = channel::bounded::<Event>(config.event_capacity);
@@ -135,75 +120,58 @@ impl Socket {
                     let mut buffer = [0; 1450];
                     match socket.recv_from(&mut buffer) {
                         Ok((bytes_read, address)) => {
-                            let remote_version = (buffer[0], buffer[1], buffer[2]);
-                            if remote_version != *VERSION {
-                                continue; // Protocol version does not match, just discard it.
-                            }
-
-                            match bincode::deserialize::<Datagram>(&buffer[3..bytes_read]) {
+                            match bincode::deserialize::<Datagram>(&buffer[..bytes_read]) {
                                 Ok(Datagram {
                                     payload,
                                     rtt_seq,
                                     rtt_ack,
                                     rtt_offset,
                                 }) => {
-                                    connections.alter(address.clone(), |conn| {
-                                        let mut connection = match conn {
-                                            Some(mut connection) => {
-                                                connection.last_interaction = Instant::now();
+                                    let mut connection =
+                                        connections.entry(address).or_insert_with(|| {
+                                            let connection =
+                                                Connection::new(config.rtt_buffer_size);
+                                            inbound_sender
+                                                .send(Event::Connected(address))
+                                                .expect("Unable to dispatch event to channel.");
 
-                                                connection
+                                            connection
+                                        });
+
+                                    connection.last_interaction = Instant::now();
+
+                                    if let Some(instant) = connection.rtt.timers.remove(&rtt_ack) {
+                                        let rtt_sample = instant.elapsed();
+                                        let rtt_corrected = rtt_sample
+                                            .checked_sub(Duration::from_millis(rtt_offset as u64))
+                                            .unwrap_or(Duration::from_millis(0));
+
+                                        match connection.rtt.current {
+                                            Some(rtt) => {
+                                                connection.rtt.current = Some(
+                                                    (rtt.mul_f32(1.0 - config.rtt_alpha))
+                                                        + rtt_corrected.mul_f32(config.rtt_alpha),
+                                                );
                                             }
                                             None => {
-                                                let connection =
-                                                    Connection::new(config.rtt_buffer_size);
-                                                inbound_sender
-                                                    .send(Event::Connected(address))
-                                                    .expect("Unable to dispatch event to channel.");
-
-                                                connection
-                                            }
-                                        };
-
-                                        if let Some(instant) =
-                                            connection.rtt.timers.remove(&rtt_ack)
-                                        {
-                                            let rtt_sample = instant.elapsed();
-                                            let rtt_corrected = rtt_sample
-                                                .checked_sub(Duration::from_millis(
-                                                    rtt_offset as u64,
-                                                ))
-                                                .unwrap_or(Duration::from_millis(0));
-
-                                            match connection.rtt.current {
-                                                Some(rtt) => {
-                                                    connection.rtt.current = Some(
-                                                        (rtt.mul_f32(1.0 - config.rtt_alpha))
-                                                            + rtt_corrected
-                                                                .mul_f32(config.rtt_alpha),
-                                                    );
-                                                }
-                                                None => {
-                                                    connection.rtt.current = Some(rtt_corrected);
-                                                }
+                                                connection.rtt.current = Some(rtt_corrected);
                                             }
                                         }
+                                    }
 
-                                        connection.rtt.remote_seq = rtt_seq;
-                                        connection.rtt.remote_timer = Instant::now();
+                                    connection.rtt.remote_seq = rtt_seq;
+                                    connection.rtt.remote_timer = Instant::now();
 
-                                        inbound_sender
-                                            .send(Event::Received {
-                                                address,
-                                                payload,
-                                                rtt: connection.rtt.current,
-                                                rtt_offset: connection.rtt.current.and(Some(
-                                                    Duration::from_millis(rtt_offset as u64),
-                                                )),
-                                            })
-                                            .expect("Unable to dispatch event to channel.");
-                                        Some(connection)
-                                    });
+                                    inbound_sender
+                                        .send(Event::Received {
+                                            address,
+                                            payload,
+                                            rtt: connection.rtt.current,
+                                            rtt_offset: connection.rtt.current.and(Some(
+                                                Duration::from_millis(rtt_offset as u64),
+                                            )),
+                                        })
+                                        .expect("Unable to dispatch event to channel.");
                                 }
                                 Err(_) => {
                                     // println!("Error parsing payload: {}", msg);
@@ -228,46 +196,34 @@ impl Socket {
                 loop {
                     match outbound_receiver.recv() {
                         Ok(Packet { address, payload }) => {
-                            connections.alter(address.clone(), |conn| {
-                                let mut connection = match conn {
-                                    Some(connection) => connection,
-                                    None => {
-                                        let connection = Connection::new(config.rtt_buffer_size);
-                                        inbound_sender
-                                            .send(Event::Connected(address))
-                                            .expect("Unable to dispatch event to channel.");
+                            let mut connection = connections.entry(address).or_insert_with(|| {
+                                let connection = Connection::new(config.rtt_buffer_size);
+                                inbound_sender
+                                    .send(Event::Connected(address))
+                                    .expect("Unable to dispatch event to channel.");
 
-                                        connection
-                                    }
-                                };
-
-                                let seq = connection.rtt.timers.insert(Instant::now());
-                                let rtt_offset = connection
-                                    .rtt
-                                    .remote_timer
-                                    .elapsed()
-                                    .as_millis()
-                                    .min(std::u16::MAX as u128)
-                                    as u16;
-
-                                let mut buffer: Vec<u8> =
-                                    vec![(*VERSION).0, (*VERSION).1, (*VERSION).2];
-                                bincode::serialize_into(
-                                    &mut buffer,
-                                    &Datagram::new(
-                                        payload,
-                                        seq,
-                                        connection.rtt.remote_seq,
-                                        rtt_offset,
-                                    ),
-                                )
-                                .expect("Unable to serialize datagram.");
-                                match socket.send_to(&buffer[0..], address) {
-                                    Ok(_) => {}
-                                    Err(msg) => println!("Error sending packet: {}", msg),
-                                }
-                                Some(connection)
+                                connection
                             });
+
+                            let seq = connection.rtt.timers.insert(Instant::now());
+                            let rtt_offset = connection
+                                .rtt
+                                .remote_timer
+                                .elapsed()
+                                .as_millis()
+                                .min(std::u16::MAX as u128)
+                                as u16;
+
+                            let mut buffer: Vec<u8> = Vec::new();
+                            bincode::serialize_into(
+                                &mut buffer,
+                                &Datagram::new(payload, seq, connection.rtt.remote_seq, rtt_offset),
+                            )
+                            .expect("Unable to serialize datagram.");
+                            match socket.send_to(&buffer[..], address) {
+                                Ok(_) => {}
+                                Err(msg) => println!("Error sending packet: {}", msg),
+                            }
                         }
                         Err(_) => {
                             break; // Is empty and disconnected, terminate thread.
@@ -283,7 +239,7 @@ impl Socket {
             let inbound_sender = inbound_sender.clone();
             thread::spawn(move || loop {
                 {
-                    connections.retain(|address, connection: &Connection| {
+                    connections.retain(|address: &SocketAddr, connection: &mut Connection| {
                         if connection.last_interaction.elapsed() >= config.timeout {
                             inbound_sender
                                 .try_send(Event::Disconnected(address.clone()))
