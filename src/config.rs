@@ -1,7 +1,7 @@
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    /// Number of incoming events the socket can hold before it blocks reading from the UDP-socket.
-    /// If the capacity is reached the underlying receive buffer may also reach its capacity resulting in packets being dropped.
+    /// Number of incoming events the socket can hold before it blocks producing more events.
+    /// If the capacity is reached the underlying receive buffers may also reach its capacity resulting in packets being dropped.
     pub event_capacity: usize,
     /// Factor used for smoothing RTT, formula: ((1.0 - rtt_alpha) * previous_estimate) + (rtt_alpha * sample_rtt)
     pub rtt_alpha: f32,

@@ -1,6 +1,6 @@
 //! # Zelda
 //!
-//! ## Example:
+//! ## Example
 //!
 //! ```rust
 //! use std::net::SocketAddr;
@@ -43,12 +43,20 @@
 //! ```
 //!
 //! More examples in the [repository](https://github.com/oskarbraten/zelda).
+//!
+//! ## Handshake
+//! 1. Client connects to server --> server sends `<connection-id><key>` to client over established TCP-connection.
+//! 2. Client sends signed `<connection-id><cmac-tag>ACK` response over UDP-socket (repeated until received).
+//! 3. Server receives ACK from client, verifies it, and sends `CONNECTED` response over TCP-connection.
 
 mod client;
 mod config;
+mod connection;
 mod event;
 mod message;
 mod server;
+mod utils;
+use connection::Connection;
 
 pub use config::Config;
 pub use event::Event;
