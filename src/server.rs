@@ -9,7 +9,7 @@ use tokio::{
     },
 };
 
-use crate::utils::{read_frame, sign, verify};
+use crate::utils::read_frame;
 use crate::{Config, Connection, Event, Message};
 
 pub type ConnectionId = u32;
@@ -130,7 +130,7 @@ impl Server {
                                 let data = &socket_buffer[12..bytes_read];
                                 if let Some(udp_address) = connection.udp_address {
                                     if address == udp_address {
-                                        if verify(&connection.key, data, tag) {
+                                        if connection.verify(data, tag) {
                                             // Verified sender, create event:
                                             inbound_sender.send((id, Event::Received {
                                                 data: data.to_vec()
@@ -141,7 +141,7 @@ impl Server {
                                     }
                                 } else {
                                     // Handshake - Received UDP, respond with CONNECTED (3):
-                                    if verify(&connection.key, data, tag) && data == b"ACK" {
+                                    if connection.verify(data, tag) && data == b"ACK" {
                                         connection.udp_address = Some(address);
                                         connection.write(b"ACK").await.unwrap(); // TODO: handle possible error?
                                         inbound_sender.send((id, Event::Connected)).await.unwrap();
@@ -160,7 +160,7 @@ impl Server {
                                     Err(err) => println!("Error writing message (TCP): {}", err)
                                 }
                             } else if let Some(address) = connection.udp_address {
-                                let tag = sign(&connection.key, &message.data);
+                                let tag = connection.sign(&message.data);
 
                                 let mut data = tag.to_vec();
                                 data.append(&mut message.data);

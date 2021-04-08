@@ -1,4 +1,6 @@
+use aes::Aes128;
 use anyhow::Result;
+use cmac::{Cmac, Mac, NewMac};
 use rand::RngCore;
 use std::{convert::TryInto, net::SocketAddr};
 use tokio::{
@@ -11,11 +13,12 @@ use tokio::{
     time::{sleep, Duration},
 };
 
-use crate::utils::{read_frame, sign};
+use crate::utils::read_frame;
 
 #[derive(Debug)]
 pub struct Connection {
     pub key: [u8; 16],
+    pub mac: Cmac<Aes128>,
     pub write_stream: OwnedWriteHalf,
     pub udp_address: Option<SocketAddr>,
 }
@@ -30,8 +33,18 @@ impl Connection {
         let id = u32::from_be_bytes(data[0..4].try_into()?);
         let key: [u8; 16] = data[4..20].try_into()?;
 
-        let mut ack = data[0..4].to_vec(); // Add id.
-        ack.extend(&sign(&key, b"ACK")); // Add tag.
+        let mut mac = Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
+
+        let tag: [u8; 8] = {
+            mac.update(b"ACK");
+
+            mac.finalize_reset().into_bytes().as_slice()[0..8]
+                .try_into()
+                .unwrap()
+        };
+
+        let mut ack = data[0..4].to_vec(); // Add id (raw received bytes).
+        ack.extend(&tag); // Add tag.
         ack.extend(b"ACK"); // Add data.
 
         // Handshake - Send ACK (2):
@@ -53,15 +66,18 @@ impl Connection {
             id,
             Self {
                 key,
+                mac,
                 write_stream,
                 udp_address: None,
             },
         ))
     }
 
-    pub async fn accept(id: u32, mut write_stream: OwnedWriteHalf) -> io::Result<Self> {
+    pub async fn accept(id: u32, mut write_stream: OwnedWriteHalf) -> Result<Self> {
         let mut key = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut key);
+
+        let mac = Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
 
         // Handshake - Initiate (1):
         write_stream.write_u32(4 + key.len() as u32).await?; // id (u32) size + key length
@@ -70,6 +86,7 @@ impl Connection {
 
         Ok(Self {
             key,
+            mac,
             write_stream,
             udp_address: None,
         })
@@ -95,5 +112,23 @@ impl Connection {
         }
 
         Ok(())
+    }
+
+    pub fn verify(&mut self, data: &[u8], tag: &[u8]) -> bool {
+        self.mac.update(data);
+
+        let verify_tag: [u8; 8] = self.mac.finalize_reset().into_bytes().as_slice()[0..8]
+            .try_into()
+            .unwrap();
+
+        verify_tag == tag
+    }
+
+    pub fn sign(&mut self, data: &[u8]) -> [u8; 8] {
+        self.mac.update(data);
+
+        self.mac.finalize_reset().into_bytes().as_slice()[0..8]
+            .try_into()
+            .unwrap()
     }
 }

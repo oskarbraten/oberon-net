@@ -25,23 +25,3 @@ pub async fn read_frame(
 
     Ok(buffer)
 }
-
-pub fn verify(key: &[u8; 16], data: &[u8], tag: &[u8]) -> bool {
-    let mut mac = Cmac::<Aes128>::new_varkey(key).unwrap();
-    mac.update(data);
-
-    let verify_tag: [u8; 8] = mac.finalize().into_bytes().as_slice()[0..8]
-        .try_into()
-        .unwrap();
-
-    verify_tag == tag
-}
-
-pub fn sign(key: &[u8; 16], data: &[u8]) -> [u8; 8] {
-    let mut mac = Cmac::<Aes128>::new_varkey(key).unwrap();
-    mac.update(data);
-
-    mac.finalize().into_bytes().as_slice()[0..8]
-        .try_into()
-        .unwrap()
-}

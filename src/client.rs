@@ -8,7 +8,7 @@ use tokio::{
     },
 };
 
-use crate::utils::{read_frame, sign, verify};
+use crate::utils::read_frame;
 use crate::{Config, Connection, Event, Message};
 
 pub struct Client;
@@ -111,7 +111,7 @@ impl Client {
                             let tag = &socket_buffer[0..8];
                             let data = &socket_buffer[8..bytes_read];
 
-                            if verify(&connection.key, data, tag) {
+                            if connection.verify(data, tag) {
                                 // Verified sender, create event:
                                 inbound_sender.send(Event::Received {
                                     data: data.to_vec()
@@ -129,7 +129,7 @@ impl Client {
                             }
                         } else {
                             let mut data = id.to_be_bytes().to_vec(); // Add id.
-                            data.extend(&sign(&connection.key, &message.data)); // Add tag.
+                            data.extend(&connection.sign(&message.data)); // Add tag.
                             data.append(&mut message.data); // Add data.
 
                             match socket.send(&data).await {
