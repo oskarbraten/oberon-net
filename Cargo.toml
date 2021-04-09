@@ -1,6 +1,6 @@
 [package]
 name = "zelda"
-description = "Zelda, a lightweight application-level network protocol for use in real-time applications."
+description = "Zelda, an application-level network protocol for games."
 version = "0.2.0"
 license = "MIT"
 authors = ["oskarbraten <oskar.braten@outlook.com>"]
@@ -11,12 +11,25 @@ edition = "2018"
 
 [dependencies]
 tokio = { version = "1.4.0", features = ["full"] }
+tokio-rustls = { version = "0.22.0", optional = true }
+webpki-roots = { version = "0.21", optional = true }
 async-channel = "1.6.1"
 byteorder = "1.4.3"
-crossbeam = "0.8.0"
-dashmap = "4.0.2"
 slab = "0.4.2"
 rand = "0.8.3"
 cmac = "0.5.1"
 aes = "0.6.0"
 anyhow = "1.0.40"
+log = { version = "0.4", features = ["release_max_level_error"] }
+
+[dev-dependencies]
+rcgen = "0.8.9"
+env_logger = "0.8.3"
+
+[features]
+default = ["tls"]
+tls = ["tokio-rustls", "webpki-roots"]
+
+[[example]]
+name = "echo"
+path = "examples/echo.rs"

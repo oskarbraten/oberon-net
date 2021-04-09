@@ -1,10 +1,10 @@
-use aes::Aes128;
-use cmac::{Cmac, Mac, NewMac};
-use std::convert::TryInto;
-use tokio::{io, io::AsyncReadExt, net::tcp::OwnedReadHalf};
+use tokio::{
+    io,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf},
+};
 
-pub async fn read_frame(
-    read_stream: &mut OwnedReadHalf,
+pub async fn read_frame<T: AsyncRead + AsyncWrite>(
+    read_stream: &mut ReadHalf<T>,
     max_frame_size: u32,
 ) -> io::Result<Vec<u8>> {
     let frame_size = {

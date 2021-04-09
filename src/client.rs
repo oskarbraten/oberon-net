@@ -1,6 +1,7 @@
 use anyhow::Result;
-use std::{future::Future, net::SocketAddr, thread};
+use std::{future::Future, net::SocketAddr};
 use tokio::{
+    io::split,
     net::{TcpStream, UdpSocket},
     sync::mpsc::{
         unbounded_channel as tokio_channel, UnboundedReceiver as TokioReceiver,
@@ -8,43 +9,30 @@ use tokio::{
     },
 };
 
-use crate::utils::read_frame;
-use crate::{Config, Connection, Event, Message};
+#[cfg(feature = "tls")]
+use tokio_rustls::{rustls::ClientConfig, webpki::DNSName, TlsConnector};
+
+#[cfg(feature = "tls")]
+use std::sync::Arc;
+
+use crate::{utils::read_frame, Delivery};
+use crate::{Config, Connection, Event};
 
 pub struct Client;
 
 impl Client {
-    pub fn connect_with_runtime(
-        tcp_address: SocketAddr,
-        udp_address: SocketAddr,
-        config: Config,
-        worker_threads: usize,
-    ) -> (ClientSender, ClientReceiver) {
-        let (sender, receiver, task) = Self::connect(tcp_address, udp_address, config);
-
-        thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(worker_threads)
-                .enable_all()
-                .build()
-                .unwrap();
-
-            runtime.block_on(task).unwrap();
-        });
-
-        (sender, receiver)
-    }
-
     pub fn connect(
         tcp_address: SocketAddr,
         udp_address: SocketAddr,
         config: Config,
+        #[cfg(feature = "tls")] client_config: ClientConfig,
+        #[cfg(feature = "tls")] domain: DNSName,
     ) -> (
         ClientSender,
         ClientReceiver,
         impl Future<Output = Result<(), anyhow::Error>>,
     ) {
-        let (outbound_sender, outbound_receiver) = tokio_channel::<Message>();
+        let (outbound_sender, outbound_receiver) = tokio_channel::<(Vec<u8>, Delivery)>();
         let (inbound_sender, inbound_receiver) =
             async_channel::bounded::<Event>(config.event_capacity);
 
@@ -54,6 +42,10 @@ impl Client {
             config,
             inbound_sender,
             outbound_receiver,
+            #[cfg(feature = "tls")]
+            client_config,
+            #[cfg(feature = "tls")]
+            domain,
         );
 
         (
@@ -72,7 +64,9 @@ impl Client {
         udp_address: SocketAddr,
         _config: Config,
         inbound_sender: async_channel::Sender<Event>,
-        mut outbound_receiver: TokioReceiver<Message>,
+        mut outbound_receiver: TokioReceiver<(Vec<u8>, Delivery)>,
+        #[cfg(feature = "tls")] client_config: ClientConfig,
+        #[cfg(feature = "tls")] domain: DNSName,
     ) -> Result<()> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(udp_address).await?;
@@ -81,10 +75,18 @@ impl Client {
 
         let stream = TcpStream::connect(tcp_address).await?;
         stream.set_nodelay(true).unwrap();
-        let (mut read_stream, write_stream) = stream.into_split();
 
-        let (id, mut connection) =
-            Connection::connect(&socket, &mut read_stream, write_stream).await?;
+        #[cfg(not(feature = "tls"))]
+        let (mut read_stream, write_stream) = split(stream);
+
+        #[cfg(feature = "tls")]
+        let (mut read_stream, write_stream) = {
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let stream = connector.connect(domain.as_ref(), stream).await?;
+            split(stream)
+        };
+
+        let (id, connection) = Connection::connect(&socket, &mut read_stream, write_stream).await?;
 
         inbound_sender.send(Event::Connected).await?;
 
@@ -98,7 +100,7 @@ impl Client {
                             }).await?;
                         },
                         Err(err) => {
-                            println!("Read frame error: {:#?}", err);
+                            log::debug!("Client read frame error: {:#?}", err);
                             inbound_sender.send(Event::Disconnected).await?;
                             break Err(err.into());
                         }
@@ -112,7 +114,6 @@ impl Client {
                             let data = &socket_buffer[8..bytes_read];
 
                             if connection.verify(data, tag) {
-                                // Verified sender, create event:
                                 inbound_sender.send(Event::Received {
                                     data: data.to_vec()
                                 }).await?;
@@ -121,20 +122,22 @@ impl Client {
                     }
                 },
                 result = outbound_receiver.recv() => {
-                    if let Some(mut message) = result {
-                        if message.reliable {
-                            match connection.write(&message.data).await {
+                    if let Some((mut data, delivery)) = result {
+                        match delivery {
+                            Delivery::Reliable => match connection.write(&data).await {
                                 Ok(()) => {},
-                                Err(err) => println!("Error writing message (TCP): {}", err)
-                            }
-                        } else {
-                            let mut data = id.to_be_bytes().to_vec(); // Add id.
-                            data.extend(&connection.sign(&message.data)); // Add tag.
-                            data.append(&mut message.data); // Add data.
+                                Err(err) => log::debug!("Error writing message (TCP): {}", err)
+                            },
+                            Delivery::Unreliable => {
+                                let mut bytes = connection.sign(&data).to_vec(); // Add tag.
+                                bytes.extend(&id.to_be_bytes()); // Add id.
+                                bytes.push(0); // Add mode (0 = message)
+                                bytes.append(&mut data); // Add data.
 
-                            match socket.send(&data).await {
-                                Ok(_) => {},
-                                Err(err) => println!("Error writing message (UDP): {}", err)
+                                match socket.send(&bytes).await {
+                                    Ok(_) => {},
+                                    Err(err) => log::debug!("Error writing message (UDP): {}", err)
+                                }
                             }
                         }
                     }
@@ -146,12 +149,20 @@ impl Client {
 
 #[derive(Debug, Clone)]
 pub struct ClientSender {
-    sender: TokioSender<Message>,
+    sender: TokioSender<(Vec<u8>, Delivery)>,
 }
 
 impl ClientSender {
-    pub fn send(&self, message: Message) -> Result<()> {
-        self.sender.send(message).map_err(|err| err.into())
+    pub fn send(&self, data: Vec<u8>, delivery: Delivery) -> Result<()> {
+        self.sender.send((data, delivery)).map_err(|err| err.into())
+    }
+
+    pub fn reliable(&self, data: Vec<u8>) -> Result<()> {
+        self.send(data, Delivery::Reliable)
+    }
+
+    pub fn unreliable(&self, data: Vec<u8>) -> Result<()> {
+        self.send(data, Delivery::Unreliable)
     }
 }
 

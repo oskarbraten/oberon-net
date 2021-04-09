@@ -1,53 +1,40 @@
 use anyhow::Result;
 use slab::Slab;
-use std::{convert::TryInto, future::Future, net::SocketAddr, thread};
+use std::sync::Arc;
+use std::{convert::TryInto, future::Future, net::SocketAddr};
 use tokio::{
+    io::split,
     net::{TcpListener, UdpSocket},
     sync::mpsc::{
         unbounded_channel as tokio_channel, UnboundedReceiver as TokioReceiver,
         UnboundedSender as TokioSender,
     },
+    sync::RwLock,
 };
 
-use crate::utils::read_frame;
-use crate::{Config, Connection, Event, Message};
+#[cfg(feature = "tls")]
+use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+
+use crate::{utils::read_frame, Delivery};
+use crate::{Config, Connection, Event};
 
 pub type ConnectionId = u32;
 
 pub struct Server;
 
 impl Server {
-    pub fn listen_with_runtime(
-        tcp_address: SocketAddr,
-        udp_address: SocketAddr,
-        config: Config,
-        worker_threads: usize,
-    ) -> (ServerSender, ServerReceiver) {
-        let (sender, receiver, task) = Self::listen(tcp_address, udp_address, config);
-
-        thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(worker_threads)
-                .enable_all()
-                .build()
-                .unwrap();
-
-            runtime.block_on(task).unwrap();
-        });
-
-        (sender, receiver)
-    }
-
     pub fn listen(
         tcp_address: SocketAddr,
         udp_address: SocketAddr,
         config: Config,
+        #[cfg(feature = "tls")] server_config: ServerConfig,
     ) -> (
         ServerSender,
         ServerReceiver,
         impl Future<Output = Result<(), anyhow::Error>>,
     ) {
-        let (outbound_sender, outbound_receiver) = tokio_channel::<(ConnectionId, Message)>();
+        let (outbound_sender, outbound_receiver) =
+            tokio_channel::<(ConnectionId, Vec<u8>, Delivery)>();
         let (inbound_sender, inbound_receiver) =
             async_channel::bounded::<(ConnectionId, Event)>(config.event_capacity);
 
@@ -57,6 +44,8 @@ impl Server {
             config,
             inbound_sender,
             outbound_receiver,
+            #[cfg(feature = "tls")]
+            server_config,
         );
 
         (
@@ -74,31 +63,52 @@ impl Server {
         tcp_address: SocketAddr,
         udp_address: SocketAddr,
         _config: Config,
-        inbound_sender: async_channel::Sender<(u32, Event)>,
-        mut outbound_receiver: TokioReceiver<(u32, Message)>,
+        inbound_sender: async_channel::Sender<(ConnectionId, Event)>,
+        mut outbound_receiver: TokioReceiver<(ConnectionId, Vec<u8>, Delivery)>,
+        #[cfg(feature = "tls")] server_config: ServerConfig,
     ) -> Result<()> {
         let socket = UdpSocket::bind(udp_address).await?;
         let mut socket_buffer: [u8; 1200] = [0; 1200];
 
+        #[cfg(feature = "tls")]
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
         let listener = TcpListener::bind(tcp_address).await?;
-        let mut connections: Slab<Connection> = Slab::new();
+
+        let connections = Arc::new(RwLock::new(Slab::new()));
 
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     if let Ok((stream, address)) = result {
-                        println!("Accepting connection: {}", address);
+                        log::debug!("Accepting connection: {}", address);
 
                         let _ = stream.set_nodelay(true);
-                        let (read_stream, write_stream) = stream.into_split();
 
-                        let entry = connections.vacant_entry();
+                        #[cfg(feature = "tls")]
+                        let (read_stream, write_stream) = {
+                            let acceptor = acceptor.clone();
+                            let stream = acceptor.accept(stream).await?;
+                            split(stream)
+                        };
 
-                        let id = entry.key() as u32;
-                        let connection = Connection::accept(id, write_stream).await.unwrap();
+                        #[cfg(not(feature = "tls"))]
+                        let (read_stream, write_stream) = split(stream);
 
-                        entry.insert(connection);
+                        let id = {
+                            let mut connections = connections.write().await;
 
+                            let entry = connections.vacant_entry();
+
+                            let id = entry.key() as u32;
+                            let connection = Connection::accept(id, write_stream).await.unwrap();
+
+                            entry.insert(connection);
+
+                            id
+                        };
+
+                        let connections = connections.clone();
                         let inbound_sender = inbound_sender.clone();
                         tokio::spawn(async move {
                             let mut read_stream = read_stream;
@@ -110,8 +120,13 @@ impl Server {
                                         })).await.unwrap();
                                     },
                                     Err(err) => {
-                                        println!("Read frame error: {:#?}", err);
-                                        // TODO: disconnect? event?
+                                        log::debug!("Read frame error: {:#?}", err);
+                                        log::debug!("Disconnecting client {}.", id);
+                                        {
+                                            let mut connections = connections.write().await;
+                                            connections.remove(id as usize);
+                                        }
+                                        inbound_sender.send((id, Event::Disconnected)).await.unwrap();
                                         break;
                                     }
                                 }
@@ -121,53 +136,56 @@ impl Server {
                 },
                 result = socket.recv_from(&mut socket_buffer) => {
                     if let Ok((bytes_read, address)) = result {
-                        // Must receive more than id (u32) + tag (u64) bytes
-                        if bytes_read > 12 {
-                            let id = socket_buffer[0..4].try_into().map(|bytes| u32::from_be_bytes(bytes));
-                            let result = id.ok().and_then(|id| connections.get_mut(id as usize).map(|c| (id, c)));
+                        // Must receive more than tag (u64) bytes + id (u32) + mode (u8)
+                        if bytes_read >= 14 {
+                            let id = socket_buffer[8..12].try_into().map(|bytes| u32::from_be_bytes(bytes));
+                            let connections = connections.read().await;
+                            let result = id.ok().and_then(|id| connections.get(id as usize).map(|c| (id, c)));
                             if let Some((id, connection)) = result {
-                                let tag = &socket_buffer[4..12];
-                                let data = &socket_buffer[12..bytes_read];
-                                if let Some(udp_address) = connection.udp_address {
-                                    if address == udp_address {
-                                        if connection.verify(data, tag) {
-                                            // Verified sender, create event:
-                                            inbound_sender.send((id, Event::Received {
-                                                data: data.to_vec()
-                                            })).await.unwrap();
-                                        }
-                                    } else {
-                                        // Ignore message because address does not match specified connection-id.
-                                    }
-                                } else {
-                                    // Handshake - Received UDP, respond with CONNECTED (3):
-                                    if connection.verify(data, tag) && data == b"ACK" {
-                                        connection.udp_address = Some(address);
-                                        connection.write(b"ACK").await.unwrap(); // TODO: handle possible error?
-                                        inbound_sender.send((id, Event::Connected)).await.unwrap();
-                                    }
+
+                                let tag = &socket_buffer[0..8];
+                                let mode = socket_buffer[12];
+                                let data = &socket_buffer[13..bytes_read];
+
+                                let mut udp_address = connection.udp_address.lock().await;
+                                if mode == 0 && udp_address.map(|addr| addr == address).unwrap_or(false) && connection.verify(data, tag) {
+                                    // Verified sender, create event:
+                                    inbound_sender.send((id, Event::Received {
+                                        data: data.to_vec()
+                                    })).await.unwrap();
+                                } else if mode == 1 && udp_address.is_none() && data == b"ACK" && connection.verify(data, tag) {
+                                    // Handshake - Received UDP, respond with ACK (3):
+                                    *udp_address = Some(address);
+                                    connection.write(b"ACK").await.unwrap(); // TODO: handle possible error?
                                 }
                             }
                         }
                     }
                 },
                 result = outbound_receiver.recv() => {
-                    if let Some((id, mut message)) = result {
-                        if let Some(connection) = connections.get_mut(id as usize) {
-                            if message.reliable {
-                                match connection.write(&message.data).await {
-                                    Ok(()) => {},
-                                    Err(err) => println!("Error writing message (TCP): {}", err)
-                                }
-                            } else if let Some(address) = connection.udp_address {
-                                let tag = connection.sign(&message.data);
+                    if let Some((id, mut data, delivery)) = result {
+                        let connections = connections.read().await;
+                        if let Some(connection) = connections.get(id as usize) {
+                            match delivery {
+                                Delivery::Reliable => {
+                                    match connection.write(&data).await {
+                                        Ok(()) => {},
+                                        Err(err) => log::debug!("Error writing message (TCP): {}", err)
+                                    }
+                                },
+                                Delivery::Unreliable => {
+                                    let udp_address = connection.udp_address.lock().await;
+                                    if let Some(address) = *udp_address {
+                                        let tag = connection.sign(&data);
 
-                                let mut data = tag.to_vec();
-                                data.append(&mut message.data);
+                                        let mut bytes = tag.to_vec();
+                                        bytes.append(&mut data);
 
-                                match socket.send_to(&data, address).await {
-                                    Ok(_) => {},
-                                    Err(err) => println!("Error writing message (UDP): {}", err)
+                                        match socket.send_to(&bytes, address).await {
+                                            Ok(_) => {},
+                                            Err(err) => log::debug!("Error writing message (UDP): {}", err)
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -180,12 +198,22 @@ impl Server {
 
 #[derive(Debug, Clone)]
 pub struct ServerSender {
-    sender: TokioSender<(ConnectionId, Message)>,
+    sender: TokioSender<(ConnectionId, Vec<u8>, Delivery)>,
 }
 
 impl ServerSender {
-    pub fn send(&self, id: ConnectionId, message: Message) -> Result<()> {
-        self.sender.send((id, message)).map_err(|err| err.into())
+    pub fn send(&self, id: ConnectionId, data: Vec<u8>, delivery: Delivery) -> Result<()> {
+        self.sender
+            .send((id, data, delivery))
+            .map_err(|err| err.into())
+    }
+
+    pub fn reliable(&self, id: ConnectionId, data: Vec<u8>) -> Result<()> {
+        self.send(id, data, Delivery::Reliable)
+    }
+
+    pub fn unreliable(&self, id: ConnectionId, data: Vec<u8>) -> Result<()> {
+        self.send(id, data, Delivery::Unreliable)
     }
 }
 
