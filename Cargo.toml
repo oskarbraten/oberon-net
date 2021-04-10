@@ -1,7 +1,7 @@
 [package]
 name = "zelda"
-description = "Zelda, a lightweight application-level network protocol for use in real-time applications."
-version = "0.1.2"
+description = "Zelda, an application-level network protocol for games."
+version = "0.2.0"
 license = "MIT"
 authors = ["oskarbraten <oskar.braten@outlook.com>"]
 readme = "README.md"
@@ -10,9 +10,29 @@ repository = "https://github.com/oskarbraten/zelda"
 edition = "2018"
 
 [dependencies]
-num-traits = "0.2"
-lazy_static = "1.4.0"
-crossbeam = "0.7.2"
-chashmap = "2.2.2"
-serde = { version = "1.0", features = ["derive"] }
-bincode = "1.2.0"
+log = { version = "0.4", features = ["release_max_level_error"] }
+anyhow = "1.0.40"
+tokio = { version = "1.4.0", features = ["full"] }
+async-channel = "1.6.1"
+tokio-rustls = { version = "0.22.0", optional = true }
+rand = "0.8.3"
+cmac = "0.5.1"
+aes = "0.6.0"
+hibitset = "0.6.3"
+slab = "0.4.2"
+
+[dev-dependencies]
+env_logger = "0.8.3"
+rcgen = "0.8.9"
+
+[features]
+default = ["rustls"]
+rustls = ["tokio-rustls"]
+
+[[example]]
+name = "echo"
+path = "examples/echo.rs"
+
+[[example]]
+name = "client"
+path = "examples/client.rs"
