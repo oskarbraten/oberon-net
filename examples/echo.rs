@@ -11,10 +11,9 @@ use tokio_rustls::{
 use zelda::{Client, Config, Event, Server};
 
 fn main() -> Result<()> {
-    let mut builder = env_logger::Builder::from_default_env();
-    builder.target(env_logger::Target::Stdout);
+    env_logger::init();
 
-    builder.init();
+    let address = "127.0.0.1:10000";
 
     let generated_certificate = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
 
@@ -43,17 +42,14 @@ fn main() -> Result<()> {
         .unwrap()
         .to_owned();
 
-    let tcp_address = "127.0.0.1:10000".parse()?;
-    let udp_address = "127.0.0.1:10001".parse()?;
-
-    let t1 = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
             let (server_sender, server_receiver, server_task) =
-                Server::listen(tcp_address, udp_address, Config::default(), server_config);
+                Server::listen(address, Config::default(), server_config);
             let (r1, r2) = tokio::join!(
                 tokio::spawn(server_task),
                 tokio::spawn(async move {
@@ -61,23 +57,13 @@ fn main() -> Result<()> {
                         match server_receiver.recv().await {
                             Ok(event) => match event {
                                 (id, Event::Connected) => {
-                                    log::info!("Client {}, connected!", id);
-
-                                    let server_sender = server_sender.clone();
-                                    tokio::spawn(async move {
-                                        loop {
-                                            sleep(Duration::from_millis(150)).await;
-                                            server_sender
-                                                .reliable(id, b"Hello, client!".to_vec())
-                                                .unwrap();
-                                        }
-                                    });
+                                    log::info!("SERVER: Client {}, connected!", id);
                                 }
-                                (id, Event::Received { data }) => {
+                                (id, Event::Received(data)) => {
                                     log::info!(
-                                        "Client {}, received: {}",
+                                        "SERVER: received: {} (Connection id: {})",
+                                        std::str::from_utf8(&data).unwrap(),
                                         id,
-                                        std::str::from_utf8(&data).unwrap()
                                     );
 
                                     let mut data = data;
@@ -85,7 +71,7 @@ fn main() -> Result<()> {
                                     server_sender.reliable(id, data).unwrap();
                                 }
                                 (id, Event::Disconnected) => {
-                                    log::info!("Client {}, disconnected!", id);
+                                    log::info!("SERVER: Client {}, disconnected!", id);
                                 }
                             },
                             Err(err) => {
@@ -110,31 +96,49 @@ fn main() -> Result<()> {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (client_sender, client_receiver, client_task) = Client::connect(
-                tcp_address,
-                udp_address,
-                Config::default(),
-                client_config,
-                client_domain,
-            );
+            let (client_sender, client_receiver, client_task) =
+                Client::connect(address, Config::default(), client_domain, client_config);
 
-            match tokio::try_join!(
-                tokio::spawn(client_task),
-                tokio::spawn(async move {
+            client_sender
+                .reliable(b"This message was sent before being connected.".to_vec())
+                .unwrap();
+
+            tokio::select! {
+                _ = sleep(Duration::from_millis(5000)) => {},
+                result = client_task => {
+                    log::info!("CLIENT: Task completed with result: {:#?}", result);
+                },
+                _ = tokio::spawn(async move {
                     loop {
                         match client_receiver.recv().await {
                             Ok(event) => match event {
                                 Event::Connected => {
-                                    log::info!("Connected to server!");
+                                    log::info!("CLIENT: Connected to server!");
+
+                                    let client_sender = client_sender.clone();
+                                    tokio::spawn(async move {
+                                        loop {
+                                            tokio::time::sleep(Duration::from_millis(500)).await;
+                                            if rand::random::<f32>() > 0.5 {
+                                                client_sender
+                                                    .reliable(b"Hello, world!".to_vec())
+                                                    .unwrap();
+                                            } else {
+                                                client_sender
+                                                    .unreliable(b"Hello, world!".to_vec())
+                                                    .unwrap();
+                                            }
+                                        }
+                                    });
                                 }
-                                Event::Received { data } => {
+                                Event::Received(data) => {
                                     log::info!(
-                                        "Received from server: {}",
+                                        "CLIENT: Received from server: {}",
                                         std::str::from_utf8(&data).unwrap()
                                     );
                                 }
                                 Event::Disconnected => {
-                                    log::info!("Disconnected from server!");
+                                    log::info!("CLIENT: Disconnected from server!");
                                 }
                             },
                             Err(err) => {
@@ -143,23 +147,11 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-                }),
-                tokio::spawn(async {
-                    sleep(Duration::from_millis(5000)).await;
-                    panic!("Stopping client.")
-                })
-            ) {
-                Ok((r1, _, _)) => {
-                    r1.unwrap();
-                }
-                Err(err) => {
-                    log::debug!("Error: {}", err);
-                }
+                }) => {}
             }
         });
     });
 
-    t1.join().unwrap();
     t2.join().unwrap();
 
     Ok(())

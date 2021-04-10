@@ -5,21 +5,19 @@ use rand::RngCore;
 use std::{convert::TryInto, net::SocketAddr};
 use tokio::{
     io,
-    io::AsyncWriteExt,
-    io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::UdpSocket,
     sync::Mutex,
     time::{sleep, Duration},
 };
 
-use crate::utils::read_frame;
-
 #[derive(Debug)]
 pub struct Connection<T: AsyncRead + AsyncWrite> {
     pub key: [u8; 16],
-    pub mac: std::sync::Mutex<Cmac<Aes128>>,
+    pub sign_mac: std::sync::Mutex<Cmac<Aes128>>,
+    pub verify_mac: std::sync::Mutex<Cmac<Aes128>>,
     pub write_stream: Mutex<WriteHalf<T>>,
-    pub udp_address: Mutex<Option<SocketAddr>>,
+    pub address: Mutex<Option<SocketAddr>>,
 }
 
 impl<T> Connection<T>
@@ -29,32 +27,35 @@ where
     pub async fn connect(
         socket: &UdpSocket,
         read_stream: &mut ReadHalf<T>,
-        write_stream: WriteHalf<T>,
+        mut write_stream: WriteHalf<T>,
     ) -> Result<(u32, Self)> {
-        let data = read_frame(read_stream, 2500).await?;
+        let data = Self::read(read_stream, 2500).await?;
         let id = u32::from_be_bytes(data[0..4].try_into()?);
         let key: [u8; 16] = data[4..20].try_into()?;
 
-        let mut mac = Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
+        let mut sign_mac =
+            Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
+        let verify_mac =
+            Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
 
         let tag: [u8; 8] = {
-            mac.update(b"ACK");
+            sign_mac.update(b"ACK");
 
-            mac.finalize_reset().into_bytes().as_slice()[0..8]
+            sign_mac.finalize_reset().into_bytes().as_slice()[0..8]
                 .try_into()
                 .unwrap()
         };
 
         let mut ack = tag.to_vec(); // Add tag.
         ack.extend(&data[0..4]); // Add id (using raw received bytes).
-        ack.push(1); // Add mode (1 = ack).
+                                 // ack.push(1); // Add mode (1 = ack).
         ack.extend(b"ACK"); // Add data.
 
-        // Handshake - Send ACK (2):
+        // Handshake - Send unreliable ACK (2):
         socket.send(&ack).await?;
         loop {
             tokio::select! {
-                result = read_frame(read_stream, 80) => {
+                result = Self::read(read_stream, 80) => {
                     let data = result?;
                     if data == b"ACK" {
                         break;
@@ -67,13 +68,18 @@ where
             }
         }
 
+        // Handshake - Send final reliable ACK (3)
+        write_stream.write_u32(b"ACK".len() as u32).await?;
+        write_stream.write(b"ACK").await?;
+
         Ok((
             id,
             Self {
                 key,
-                mac: std::sync::Mutex::new(mac),
+                sign_mac: std::sync::Mutex::new(sign_mac),
+                verify_mac: std::sync::Mutex::new(verify_mac),
                 write_stream: Mutex::new(write_stream),
-                udp_address: Mutex::new(None),
+                address: Mutex::new(None),
             },
         ))
     }
@@ -82,7 +88,10 @@ where
         let mut key = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut key);
 
-        let mac = Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
+        let sign_mac =
+            Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
+        let verify_mac =
+            Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
 
         // Handshake - Initiate (1):
         write_stream.write_u32(4 + key.len() as u32).await?; // Connection id (u32) size + Key size
@@ -91,9 +100,10 @@ where
 
         Ok(Self {
             key,
-            mac: std::sync::Mutex::new(mac),
+            sign_mac: std::sync::Mutex::new(sign_mac),
+            verify_mac: std::sync::Mutex::new(verify_mac),
             write_stream: Mutex::new(write_stream),
-            udp_address: Mutex::new(None),
+            address: Mutex::new(None),
         })
     }
 
@@ -107,23 +117,31 @@ where
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn write_chunks(&self, chunks: &[&[u8]]) -> io::Result<()> {
-        let length = chunks.iter().map(|data| data.len()).sum::<usize>() as u32;
+    pub async fn read(read_stream: &mut ReadHalf<T>, max_size: u32) -> io::Result<Vec<u8>> {
+        let frame_size = {
+            let mut bytes = [0; 4];
+            read_stream.read_exact(&mut bytes).await?;
 
-        let mut write_stream = self.write_stream.lock().await;
-
-        write_stream.write_u32(length).await?;
-
-        for data in chunks {
-            write_stream.write(data).await?;
+            u32::from_be_bytes(bytes)
+        };
+        if frame_size > max_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Max frame size exceeded.",
+            ));
         }
 
-        Ok(())
+        let mut buffer = vec![];
+        read_stream
+            .take(frame_size as u64)
+            .read_to_end(&mut buffer)
+            .await?;
+
+        Ok(buffer)
     }
 
     pub fn verify(&self, data: &[u8], tag: &[u8]) -> bool {
-        let mut mac = self.mac.lock().unwrap();
+        let mut mac = self.verify_mac.lock().unwrap();
 
         mac.update(data);
 
@@ -135,7 +153,7 @@ where
     }
 
     pub fn sign(&self, data: &[u8]) -> [u8; 8] {
-        let mut mac = self.mac.lock().unwrap();
+        let mut mac = self.sign_mac.lock().unwrap();
 
         mac.update(data);
 

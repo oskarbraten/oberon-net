@@ -1,85 +1,75 @@
 use anyhow::Result;
-use std::{future::Future, net::SocketAddr};
+use std::future::Future;
 use tokio::{
     io::split,
-    net::{TcpStream, UdpSocket},
-    sync::mpsc::{
-        unbounded_channel as tokio_channel, UnboundedReceiver as TokioReceiver,
-        UnboundedSender as TokioSender,
-    },
+    net::{TcpStream, ToSocketAddrs, UdpSocket},
+    sync::mpsc,
 };
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "rustls")]
 use tokio_rustls::{rustls::ClientConfig, webpki::DNSName, TlsConnector};
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "rustls")]
 use std::sync::Arc;
 
-use crate::{utils::read_frame, Delivery};
-use crate::{Config, Connection, Event};
+use crate::{Config, Connection, Delivery, Event, Receiver, Sender};
 
 pub struct Client;
 
 impl Client {
-    pub fn connect(
-        tcp_address: SocketAddr,
-        udp_address: SocketAddr,
+    /// Connect to a server.
+    /// Returns a [`Sender`], [`Receiver`] and a [`Future`] which must be awaited in an async executor (see the examples in the [repository](https://github.com/oskarbraten/zelda/)).
+    /// The client can run in a separate thread and messages/events can be sent/received in a synchronous context.
+    pub fn connect<A: ToSocketAddrs>(
+        address: A,
         config: Config,
-        #[cfg(feature = "tls")] client_config: ClientConfig,
-        #[cfg(feature = "tls")] domain: DNSName,
+        #[cfg(feature = "rustls")] domain: DNSName,
+        #[cfg(feature = "rustls")] client_config: ClientConfig,
     ) -> (
-        ClientSender,
-        ClientReceiver,
+        Sender<(Vec<u8>, Delivery)>,
+        Receiver<Event>,
         impl Future<Output = Result<(), anyhow::Error>>,
     ) {
-        let (outbound_sender, outbound_receiver) = tokio_channel::<(Vec<u8>, Delivery)>();
+        let (outbound_sender, outbound_receiver) = mpsc::unbounded_channel::<(Vec<u8>, Delivery)>();
         let (inbound_sender, inbound_receiver) =
             async_channel::bounded::<Event>(config.event_capacity);
 
         let task = Self::task(
-            tcp_address,
-            udp_address,
+            address,
             config,
             inbound_sender,
             outbound_receiver,
-            #[cfg(feature = "tls")]
-            client_config,
-            #[cfg(feature = "tls")]
+            #[cfg(feature = "rustls")]
             domain,
+            #[cfg(feature = "rustls")]
+            client_config,
         );
 
         (
-            ClientSender {
-                sender: outbound_sender,
-            },
-            ClientReceiver {
-                receiver: inbound_receiver,
-            },
+            Sender::new(outbound_sender),
+            Receiver::new(inbound_receiver),
             task,
         )
     }
 
-    async fn task(
-        tcp_address: SocketAddr,
-        udp_address: SocketAddr,
-        _config: Config,
+    async fn task<A: ToSocketAddrs>(
+        address: A,
+        config: Config,
         inbound_sender: async_channel::Sender<Event>,
-        mut outbound_receiver: TokioReceiver<(Vec<u8>, Delivery)>,
-        #[cfg(feature = "tls")] client_config: ClientConfig,
-        #[cfg(feature = "tls")] domain: DNSName,
+        mut outbound_receiver: mpsc::UnboundedReceiver<(Vec<u8>, Delivery)>,
+        #[cfg(feature = "rustls")] domain: DNSName,
+        #[cfg(feature = "rustls")] client_config: ClientConfig,
     ) -> Result<()> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect(udp_address).await?;
+        socket.connect(&address).await?;
 
-        let mut socket_buffer: [u8; 1200] = [0; 1200];
-
-        let stream = TcpStream::connect(tcp_address).await?;
+        let stream = TcpStream::connect(&address).await?;
         stream.set_nodelay(true).unwrap();
 
-        #[cfg(not(feature = "tls"))]
+        #[cfg(not(feature = "rustls"))]
         let (mut read_stream, write_stream) = split(stream);
 
-        #[cfg(feature = "tls")]
+        #[cfg(feature = "rustls")]
         let (mut read_stream, write_stream) = {
             let connector = TlsConnector::from(Arc::new(client_config));
             let stream = connector.connect(domain.as_ref(), stream).await?;
@@ -87,36 +77,32 @@ impl Client {
         };
 
         let (id, connection) = Connection::connect(&socket, &mut read_stream, write_stream).await?;
-
         inbound_sender.send(Event::Connected).await?;
 
+        let mut recv_buffer = [0u8; std::u16::MAX as usize];
         loop {
             tokio::select! {
-                result = read_frame(&mut read_stream, 500000) => {
+                result = Connection::read(&mut read_stream, config.max_reliable_size) => {
                     match result {
                         Ok(data) => {
-                            inbound_sender.send(Event::Received {
-                                data
-                            }).await?;
+                            inbound_sender.send(Event::Received(data)).await?;
                         },
                         Err(err) => {
-                            log::debug!("Client read frame error: {:#?}", err);
+                            log::debug!("Error reading frame (TCP): {:#?}", err);
                             inbound_sender.send(Event::Disconnected).await?;
-                            break Err(err.into());
+                            return Err(err.into());
                         }
                     }
                 },
-                result = socket.recv(&mut socket_buffer) => {
+                result = socket.recv(&mut recv_buffer) => {
                     if let Ok(bytes_read) = result {
                         // Must receive more than tag (u64) bytes
                         if bytes_read > 8 {
-                            let tag = &socket_buffer[0..8];
-                            let data = &socket_buffer[8..bytes_read];
+                            let tag = &recv_buffer[0..8];
+                            let data = &recv_buffer[8..bytes_read];
 
                             if connection.verify(data, tag) {
-                                inbound_sender.send(Event::Received {
-                                    data: data.to_vec()
-                                }).await?;
+                                inbound_sender.send(Event::Received(data.to_vec())).await?;
                             }
                         }
                     }
@@ -131,7 +117,6 @@ impl Client {
                             Delivery::Unreliable => {
                                 let mut bytes = connection.sign(&data).to_vec(); // Add tag.
                                 bytes.extend(&id.to_be_bytes()); // Add id.
-                                bytes.push(0); // Add mode (0 = message)
                                 bytes.append(&mut data); // Add data.
 
                                 match socket.send(&bytes).await {
@@ -144,39 +129,5 @@ impl Client {
                 }
             }
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ClientSender {
-    sender: TokioSender<(Vec<u8>, Delivery)>,
-}
-
-impl ClientSender {
-    pub fn send(&self, data: Vec<u8>, delivery: Delivery) -> Result<()> {
-        self.sender.send((data, delivery)).map_err(|err| err.into())
-    }
-
-    pub fn reliable(&self, data: Vec<u8>) -> Result<()> {
-        self.send(data, Delivery::Reliable)
-    }
-
-    pub fn unreliable(&self, data: Vec<u8>) -> Result<()> {
-        self.send(data, Delivery::Unreliable)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ClientReceiver {
-    receiver: async_channel::Receiver<Event>,
-}
-
-impl ClientReceiver {
-    pub async fn recv(&self) -> Result<Event> {
-        self.receiver.recv().await.map_err(|err| err.into())
-    }
-
-    pub fn try_recv(&self) -> Result<Event> {
-        self.receiver.try_recv().map_err(|err| err.into())
     }
 }
