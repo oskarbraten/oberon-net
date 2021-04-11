@@ -32,7 +32,16 @@ async fn main() -> Result<()> {
         config
     };
 
-    let (sender, mut receiver, task) = Server::listen(address, Config::default(), config);
+    let correct_token = b"TOKEN".to_vec();
+
+    let (sender, mut receiver, task) =
+        Server::listen(address, Config::default(), config, move |token| {
+            if token == correct_token {
+                Some(token)
+            } else {
+                None
+            }
+        });
 
     tokio::try_join!(
         tokio::spawn(async move {

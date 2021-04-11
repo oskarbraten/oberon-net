@@ -25,19 +25,28 @@ use futures::StreamExt;
 
 pub struct Server;
 
-impl Server {
+impl<'a> Server {
     /// Start a server listening on the specified address.
     /// Returns a [`Sender`], [`Receiver`] and a [`Future`] which must be awaited in an async executor (see the examples in the [repository](https://github.com/oskarbraten/zelda/)).
     /// The server can run in a separate thread and messages/events can be sent/received in a synchronous context.
-    pub fn listen<A: ToSocketAddrs>(
+    pub fn listen<
+        A: ToSocketAddrs,
+        #[cfg(feature = "token")] F: 'static,
+        #[cfg(feature = "token")] U: 'static,
+    >(
         address: A,
         config: Config,
         #[cfg(feature = "rustls")] server_config: ServerConfig,
+        #[cfg(feature = "token")] validation_fn: F,
     ) -> (
         Sender<(ConnectionId, Vec<u8>, Delivery)>,
         Receiver<(ConnectionId, Event)>,
         impl Future<Output = Result<(), ServerError>>,
-    ) {
+    )
+    where
+        U: Send + Sync + Clone,
+        F: (Fn(Vec<u8>) -> Option<U>) + Send + Sync + Clone,
+    {
         let (outbound_sender, outbound_receiver) =
             sender::channel::<(ConnectionId, Vec<u8>, Delivery)>();
         let (inbound_sender, inbound_receiver) =
@@ -50,6 +59,8 @@ impl Server {
             outbound_receiver,
             #[cfg(feature = "rustls")]
             server_config,
+            #[cfg(feature = "token")]
+            validation_fn,
         );
 
         (
@@ -59,19 +70,37 @@ impl Server {
         )
     }
 
-    async fn task<A: ToSocketAddrs>(
+    async fn task<
+        A: ToSocketAddrs,
+        #[cfg(feature = "token")] F: 'static,
+        #[cfg(feature = "token")] U: 'static,
+    >(
         address: A,
         config: Config,
         mut inbound_sender: receiver::InnerSender<(ConnectionId, Event)>,
         mut outbound_receiver: sender::InnerReceiver<(ConnectionId, Vec<u8>, Delivery)>,
         #[cfg(feature = "rustls")] server_config: ServerConfig,
-    ) -> Result<(), ServerError> {
+        #[cfg(feature = "token")] validation_fn: F,
+    ) -> Result<(), ServerError>
+    where
+        U: Send + Sync + Clone,
+        F: (Fn(Vec<u8>) -> Option<U>) + Send + Sync + Clone,
+    {
+        // #[cfg(feature = "token")]
+        // let validation_fn = Arc::new(validation_fn);
+
         let socket = UdpSocket::bind(&address).await?;
 
         #[cfg(feature = "rustls")]
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
         let listener = TcpListener::bind(&address).await?;
+
+        // #[cfg(feature = "token")]
+        // let connections: Arc<RwLock<Slab<Connection<_, U>>>> = Arc::new(RwLock::new(Slab::new()));
+
+        // #[cfg(not(feature = "token"))]
+        // let connections: Arc<RwLock<Slab<Connection<_, ()>>>> = Arc::new(RwLock::new(Slab::new()));
 
         let connections = Arc::new(RwLock::new(Slab::new()));
         let established_connections = Arc::new(RwLock::new(BitSet::new()));
@@ -111,6 +140,9 @@ impl Server {
                         let connections = connections.clone();
                         let established_connections = established_connections.clone();
                         let mut inbound_sender = inbound_sender.clone();
+                        // #[cfg(feature = "token")]
+                        let validation_fn = validation_fn.clone();
+
                         tokio::spawn(async move {
                             let mut read_stream = read_stream;
                             loop {
@@ -119,7 +151,26 @@ impl Server {
                                         let is_connected = established_connections.read().await.contains(id);
                                         if is_connected {
                                             inbound_sender.try_send((id, Event::Received(data))).unwrap();
-                                        } else if data == b"ACK" {
+                                        } else if &data[0..3] == b"ACK" {
+
+                                            #[cfg(feature = "token")]
+                                            let token_data = {
+                                                let token = data[3..].to_vec();
+                                                validation_fn(token)
+                                            };
+                                            #[cfg(feature = "token")]
+                                            if token_data.is_none() {
+                                                // Token validation failed, remove and drop connection.
+                                                let mut connections = connections.write().await;
+                                                connections.remove(id as usize);
+                                                break;
+                                            } else {
+                                                let mut connections = connections.write().await;
+                                                let connection = connections.get_mut(id as usize).unwrap();
+
+                                                connection.data = Some(token_data);
+                                            }
+
                                             established_connections.write().await.add(id);
                                             inbound_sender.try_send((id, Event::Connected)).unwrap();
                                         }

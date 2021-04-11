@@ -24,7 +24,13 @@ async fn main() -> Result<()> {
 
     let address = "localhost:10000";
 
-    let (sender, mut receiver, task) = Client::connect(address, Config::default(), domain, config);
+    let (sender, mut receiver, task) = Client::connect(
+        address,
+        Config::default(),
+        domain,
+        config,
+        b"TOKEN".to_vec(),
+    );
 
     tokio::spawn(async move {
         task.await.unwrap();

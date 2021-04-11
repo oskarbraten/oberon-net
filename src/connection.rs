@@ -23,15 +23,16 @@ pub enum ConnectionError {
 }
 
 #[derive(Debug)]
-pub struct Connection<T: AsyncRead + AsyncWrite> {
+pub struct Connection<T: AsyncRead + AsyncWrite, U = ()> {
     pub key: [u8; 16],
     pub sign_mac: std::sync::Mutex<Cmac<Aes128>>,
     pub verify_mac: std::sync::Mutex<Cmac<Aes128>>,
     pub write_stream: Mutex<WriteHalf<T>>,
     pub address: Mutex<Option<SocketAddr>>,
+    pub data: Option<U>,
 }
 
-impl<T> Connection<T>
+impl<T> Connection<T, ()>
 where
     T: AsyncRead + AsyncWrite,
 {
@@ -39,6 +40,7 @@ where
         socket: &UdpSocket,
         read_stream: &mut ReadHalf<T>,
         mut write_stream: WriteHalf<T>,
+        #[cfg(feature = "token")] token: Vec<u8>,
     ) -> Result<(u32, Self), ConnectionError> {
         let data = Self::read(read_stream, 2500).await?;
 
@@ -66,7 +68,6 @@ where
 
         let mut ack = tag.to_vec(); // Add tag.
         ack.extend(&data[0..4]); // Add id (using raw received bytes).
-                                 // ack.push(1); // Add mode (1 = ack).
         ack.extend(b"ACK"); // Add data.
 
         // Handshake - Send unreliable ACK (2):
@@ -86,9 +87,22 @@ where
             }
         }
 
-        // Handshake - Send final reliable ACK (3)
-        write_stream.write_u32(b"ACK".len() as u32).await?;
-        write_stream.write(b"ACK").await?;
+        #[cfg(feature = "token")]
+        {
+            // Handshake - Send final reliable ACK and token (3):
+            write_stream
+                .write_u32((b"ACK".len() + token.len()) as u32)
+                .await?;
+            write_stream.write(b"ACK").await?;
+            write_stream.write(&token).await?;
+        }
+
+        #[cfg(not(feature = "token"))]
+        {
+            // Handshake - Send final reliable ACK (3):
+            write_stream.write_u32(b"ACK".len() as u32).await?;
+            write_stream.write(b"ACK").await?;
+        }
 
         Ok((
             id,
@@ -98,10 +112,16 @@ where
                 verify_mac: std::sync::Mutex::new(verify_mac),
                 write_stream: Mutex::new(write_stream),
                 address: Mutex::new(None),
+                data: None,
             },
         ))
     }
+}
 
+impl<T, U> Connection<T, U>
+where
+    T: AsyncRead + AsyncWrite,
+{
     pub async fn accept(id: u32, mut write_stream: WriteHalf<T>) -> Result<Self, ConnectionError> {
         let mut key = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut key);
@@ -122,6 +142,7 @@ where
             verify_mac: std::sync::Mutex::new(verify_mac),
             write_stream: Mutex::new(write_stream),
             address: Mutex::new(None),
+            data: None,
         })
     }
 
@@ -133,29 +154,6 @@ where
         write_stream.flush().await?;
 
         Ok(())
-    }
-
-    pub async fn read(read_stream: &mut ReadHalf<T>, max_size: u32) -> io::Result<Vec<u8>> {
-        let frame_size = {
-            let mut bytes = [0; 4];
-            read_stream.read_exact(&mut bytes).await?;
-
-            u32::from_be_bytes(bytes)
-        };
-        if frame_size > max_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Max frame size exceeded.",
-            ));
-        }
-
-        let mut buffer = vec![];
-        read_stream
-            .take(frame_size as u64)
-            .read_to_end(&mut buffer)
-            .await?;
-
-        Ok(buffer)
     }
 
     pub fn verify(&self, data: &[u8], tag: &[u8]) -> bool {
@@ -178,5 +176,33 @@ where
         mac.finalize_reset().into_bytes().as_slice()[0..8]
             .try_into()
             .unwrap()
+    }
+}
+
+impl<T> Connection<T>
+where
+    T: AsyncRead + AsyncWrite,
+{
+    pub async fn read(read_stream: &mut ReadHalf<T>, max_size: u32) -> io::Result<Vec<u8>> {
+        let frame_size = {
+            let mut bytes = [0; 4];
+            read_stream.read_exact(&mut bytes).await?;
+
+            u32::from_be_bytes(bytes)
+        };
+        if frame_size > max_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Max frame size exceeded.",
+            ));
+        }
+
+        let mut buffer = vec![];
+        read_stream
+            .take(frame_size as u64)
+            .read_to_end(&mut buffer)
+            .await?;
+
+        Ok(buffer)
     }
 }

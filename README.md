@@ -10,7 +10,7 @@ Zelda is message based server/client transport library for game networking, with
 
 ## Features
 * [x] Reliable messages with configurable maximum size
-* [x] Unreliable messages ()
+* [x] Unreliable messages
 * [x] Encryption for reliable messages (TLS)
 * [x] Message authentication for unreliable messages (not encrypted)
 * [x] Thread-safe async send/receive

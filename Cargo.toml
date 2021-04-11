@@ -26,13 +26,6 @@ env_logger = "0.8.3"
 anyhow = "1.0"
 
 [features]
-default = ["rustls"]
+default = ["rustls", "token"]
 rustls = ["tokio-rustls"]
-
-[[example]]
-name = "echo"
-path = "examples/echo.rs"
-
-[[example]]
-name = "client"
-path = "examples/client.rs"
+token = []

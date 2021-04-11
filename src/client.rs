@@ -39,6 +39,7 @@ impl Client {
         config: Config,
         #[cfg(feature = "rustls")] domain: DNSName,
         #[cfg(feature = "rustls")] client_config: ClientConfig,
+        #[cfg(feature = "token")] token: Vec<u8>,
     ) -> (
         Sender<(Vec<u8>, Delivery)>,
         Receiver<Event>,
@@ -56,6 +57,8 @@ impl Client {
             domain,
             #[cfg(feature = "rustls")]
             client_config,
+            #[cfg(feature = "token")]
+            token,
         );
 
         (
@@ -72,6 +75,7 @@ impl Client {
         mut outbound_receiver: sender::InnerReceiver<(Vec<u8>, Delivery)>,
         #[cfg(feature = "rustls")] domain: DNSName,
         #[cfg(feature = "rustls")] client_config: ClientConfig,
+        #[cfg(feature = "token")] token: Vec<u8>,
     ) -> Result<(), ClientError> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(&address).await?;
@@ -89,7 +93,14 @@ impl Client {
             split(stream)
         };
 
-        let (id, connection) = Connection::connect(&socket, &mut read_stream, write_stream).await?;
+        let (id, connection) = Connection::connect(
+            &socket,
+            &mut read_stream,
+            write_stream,
+            #[cfg(feature = "token")]
+            token,
+        )
+        .await?;
         inbound_sender.try_send(Event::Connected)?;
 
         let mut recv_buffer = [0u8; std::u16::MAX as usize];

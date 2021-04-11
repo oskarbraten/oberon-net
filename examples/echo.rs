@@ -55,8 +55,15 @@ fn main() -> Result<()> {
             .build()
             .unwrap();
         runtime.block_on(async {
+            let correct_token = b"TOKEN".to_vec();
             let (server_sender, mut server_receiver, server_task) =
-                Server::listen(address, Config::default(), server_config);
+                Server::listen(address, Config::default(), server_config, move |token| {
+                    if token == correct_token {
+                        Some(token)
+                    } else {
+                        None
+                    }
+                });
             let (r1, r2) = tokio::join!(
                 tokio::spawn(server_task),
                 tokio::spawn(async move {
@@ -103,8 +110,13 @@ fn main() -> Result<()> {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (client_sender, mut client_receiver, client_task) =
-                Client::connect(address, Config::default(), client_domain, client_config);
+            let (client_sender, mut client_receiver, client_task) = Client::connect(
+                address,
+                Config::default(),
+                client_domain,
+                client_config,
+                b"TOKEN".to_vec(),
+            );
 
             client_sender
                 .reliable(b"This message was sent before being connected.".to_vec())
