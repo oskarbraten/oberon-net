@@ -1,5 +1,4 @@
 use anyhow::Result;
-use rcgen::generate_simple_self_signed;
 use tokio::time::{sleep, Duration};
 use tokio_rustls::{
     rustls::{
@@ -15,26 +14,34 @@ fn main() -> Result<()> {
 
     let address = "127.0.0.1:10000";
 
-    let generated_certificate = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-
     let server_config = {
         let mut config = ServerConfig::new(NoClientAuth::new());
-        let certificates = certs(&mut generated_certificate.serialize_pem()?.as_bytes()).unwrap();
 
-        let keys =
-            pkcs8_private_keys(&mut generated_certificate.serialize_private_key_pem().as_bytes())
-                .unwrap();
+        let certificates = {
+            let file = std::fs::File::open("./examples/certs/cert.pem")?;
+            let mut buffered = std::io::BufReader::new(file);
 
-        config.set_single_cert(certificates, keys[0].clone())?;
+            certs(&mut buffered).unwrap()
+        };
+
+        let key = {
+            let file = std::fs::File::open("./examples/certs/key.pem")?;
+            let mut buffered = std::io::BufReader::new(file);
+
+            pkcs8_private_keys(&mut buffered).unwrap()[0].clone()
+        };
+
+        config.set_single_cert(certificates, key)?;
         config
     };
 
     let client_config = {
         let mut config = ClientConfig::new();
-        config
-            .root_store
-            .add_pem_file(&mut generated_certificate.serialize_pem()?.as_bytes())
-            .unwrap();
+
+        let file = std::fs::File::open("./examples/certs/cert.pem")?;
+        let mut buffered = std::io::BufReader::new(file);
+
+        config.root_store.add_pem_file(&mut buffered).unwrap();
         config
     };
 
@@ -48,14 +55,14 @@ fn main() -> Result<()> {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (server_sender, server_receiver, server_task) =
+            let (server_sender, mut server_receiver, server_task) =
                 Server::listen(address, Config::default(), server_config);
             let (r1, r2) = tokio::join!(
                 tokio::spawn(server_task),
                 tokio::spawn(async move {
                     loop {
                         match server_receiver.recv().await {
-                            Ok(event) => match event {
+                            Some(event) => match event {
                                 (id, Event::Connected) => {
                                     log::info!("SERVER: Client {}, connected!", id);
                                 }
@@ -74,8 +81,8 @@ fn main() -> Result<()> {
                                     log::info!("SERVER: Client {}, disconnected!", id);
                                 }
                             },
-                            Err(err) => {
-                                log::debug!("{}", err);
+                            None => {
+                                log::debug!("SERVER: Receiver returned none.");
                                 break;
                             }
                         }
@@ -96,7 +103,7 @@ fn main() -> Result<()> {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (client_sender, client_receiver, client_task) =
+            let (client_sender, mut client_receiver, client_task) =
                 Client::connect(address, Config::default(), client_domain, client_config);
 
             client_sender
@@ -111,7 +118,7 @@ fn main() -> Result<()> {
                 _ = tokio::spawn(async move {
                     loop {
                         match client_receiver.recv().await {
-                            Ok(event) => match event {
+                            Some(event) => match event {
                                 Event::Connected => {
                                     log::info!("CLIENT: Connected to server!");
 
@@ -141,8 +148,8 @@ fn main() -> Result<()> {
                                     log::info!("CLIENT: Disconnected from server!");
                                 }
                             },
-                            Err(err) => {
-                                log::debug!("{}", err);
+                            None => {
+                                log::debug!("CLIENT: Receiver returned none.");
                                 break;
                             }
                         }

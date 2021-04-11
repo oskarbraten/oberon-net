@@ -2,7 +2,6 @@ use std::future::Future;
 use tokio::{
     io::split,
     net::{TcpStream, ToSocketAddrs, UdpSocket},
-    sync::mpsc,
 };
 
 #[cfg(feature = "rustls")]
@@ -11,7 +10,12 @@ use tokio_rustls::{rustls::ClientConfig, webpki::DNSName, TlsConnector};
 #[cfg(feature = "rustls")]
 use std::sync::Arc;
 
-use crate::{connection::ConnectionError, Config, Connection, Delivery, Event, Receiver, Sender};
+use crate::{
+    connection::ConnectionError, receiver, sender, Config, Connection, Delivery, Event, Receiver,
+    Sender,
+};
+
+use futures::StreamExt;
 
 use thiserror::Error;
 #[derive(Debug, Error)]
@@ -20,8 +24,8 @@ pub enum ClientError {
     Io(#[from] std::io::Error),
     #[error("Unable to establish connection.")]
     Connection(#[from] ConnectionError),
-    #[error("Unable to send message.")]
-    Send(#[from] async_channel::SendError<Event>),
+    #[error("Unable to dispatch event.")]
+    Event(#[from] receiver::TrySendError<Event>),
 }
 
 pub struct Client;
@@ -40,9 +44,8 @@ impl Client {
         Receiver<Event>,
         impl Future<Output = Result<(), ClientError>>,
     ) {
-        let (outbound_sender, outbound_receiver) = mpsc::unbounded_channel::<(Vec<u8>, Delivery)>();
-        let (inbound_sender, inbound_receiver) =
-            async_channel::bounded::<Event>(config.event_capacity);
+        let (outbound_sender, outbound_receiver) = sender::channel::<(Vec<u8>, Delivery)>();
+        let (inbound_sender, inbound_receiver) = receiver::channel::<Event>(config.event_capacity);
 
         let task = Self::task(
             address,
@@ -65,8 +68,8 @@ impl Client {
     async fn task<A: ToSocketAddrs>(
         address: A,
         config: Config,
-        inbound_sender: async_channel::Sender<Event>,
-        mut outbound_receiver: mpsc::UnboundedReceiver<(Vec<u8>, Delivery)>,
+        mut inbound_sender: receiver::InnerSender<Event>,
+        mut outbound_receiver: sender::InnerReceiver<(Vec<u8>, Delivery)>,
         #[cfg(feature = "rustls")] domain: DNSName,
         #[cfg(feature = "rustls")] client_config: ClientConfig,
     ) -> Result<(), ClientError> {
@@ -87,7 +90,7 @@ impl Client {
         };
 
         let (id, connection) = Connection::connect(&socket, &mut read_stream, write_stream).await?;
-        inbound_sender.send(Event::Connected).await?;
+        inbound_sender.try_send(Event::Connected)?;
 
         let mut recv_buffer = [0u8; std::u16::MAX as usize];
         loop {
@@ -95,11 +98,11 @@ impl Client {
                 result = Connection::read(&mut read_stream, config.max_reliable_size) => {
                     match result {
                         Ok(data) => {
-                            inbound_sender.send(Event::Received(data)).await?;
+                            inbound_sender.try_send(Event::Received(data))?;
                         },
                         Err(err) => {
                             log::debug!("Error reading frame (TCP): {:#?}", err);
-                            inbound_sender.send(Event::Disconnected).await?;
+                            inbound_sender.try_send(Event::Disconnected)?;
                             return Err(err.into());
                         }
                     }
@@ -112,12 +115,12 @@ impl Client {
                             let data = &recv_buffer[8..bytes_read];
 
                             if connection.verify(data, tag) {
-                                inbound_sender.send(Event::Received(data.to_vec())).await?;
+                                inbound_sender.try_send(Event::Received(data.to_vec()))?;
                             }
                         }
                     }
                 },
-                result = outbound_receiver.recv() => {
+                result = outbound_receiver.next() => {
                     if let Some((mut data, delivery)) = result {
                         match delivery {
                             Delivery::Reliable => match connection.write(&data).await {

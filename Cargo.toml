@@ -13,17 +13,16 @@ edition = "2018"
 log = { version = "0.4", features = ["release_max_level_error"] }
 thiserror = "1.0"
 tokio = { version = "1.4.0", features = ["full"] }
-async-channel = "1.6.1"
 tokio-rustls = { version = "0.22.0", optional = true }
+futures = "0.3"
 rand = "0.8.3"
 cmac = "0.5.1"
 aes = "0.6.0"
-hibitset = "0.6.3"
+hibitset = { version = "0.6.3", default-features = false }
 slab = "0.4.2"
 
 [dev-dependencies]
 env_logger = "0.8.3"
-rcgen = "0.8.9"
 anyhow = "1.0"
 
 [features]

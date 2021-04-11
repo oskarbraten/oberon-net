@@ -4,7 +4,6 @@ use std::{convert::TryInto, future::Future, sync::Arc};
 use tokio::{
     io::split,
     net::{TcpListener, ToSocketAddrs, UdpSocket},
-    sync::mpsc,
     sync::RwLock,
 };
 
@@ -18,7 +17,11 @@ pub enum ServerError {
     Io(#[from] std::io::Error),
 }
 
-use crate::{Config, Connection, ConnectionId, Delivery, Event, Receiver, Sender};
+use crate::{
+    receiver, sender, Config, Connection, ConnectionId, Delivery, Event, Receiver, Sender,
+};
+
+use futures::StreamExt;
 
 pub struct Server;
 
@@ -36,9 +39,9 @@ impl Server {
         impl Future<Output = Result<(), ServerError>>,
     ) {
         let (outbound_sender, outbound_receiver) =
-            mpsc::unbounded_channel::<(ConnectionId, Vec<u8>, Delivery)>();
+            sender::channel::<(ConnectionId, Vec<u8>, Delivery)>();
         let (inbound_sender, inbound_receiver) =
-            async_channel::bounded::<(ConnectionId, Event)>(config.event_capacity);
+            receiver::channel::<(ConnectionId, Event)>(config.event_capacity);
 
         let task = Self::task(
             address,
@@ -59,8 +62,8 @@ impl Server {
     async fn task<A: ToSocketAddrs>(
         address: A,
         config: Config,
-        inbound_sender: async_channel::Sender<(ConnectionId, Event)>,
-        mut outbound_receiver: mpsc::UnboundedReceiver<(ConnectionId, Vec<u8>, Delivery)>,
+        mut inbound_sender: receiver::InnerSender<(ConnectionId, Event)>,
+        mut outbound_receiver: sender::InnerReceiver<(ConnectionId, Vec<u8>, Delivery)>,
         #[cfg(feature = "rustls")] server_config: ServerConfig,
     ) -> Result<(), ServerError> {
         let socket = UdpSocket::bind(&address).await?;
@@ -107,7 +110,7 @@ impl Server {
 
                         let connections = connections.clone();
                         let established_connections = established_connections.clone();
-                        let inbound_sender = inbound_sender.clone();
+                        let mut inbound_sender = inbound_sender.clone();
                         tokio::spawn(async move {
                             let mut read_stream = read_stream;
                             loop {
@@ -115,10 +118,10 @@ impl Server {
                                     Ok(data) => {
                                         let is_connected = established_connections.read().await.contains(id);
                                         if is_connected {
-                                            inbound_sender.send((id, Event::Received(data))).await.unwrap();
+                                            inbound_sender.try_send((id, Event::Received(data))).unwrap();
                                         } else if data == b"ACK" {
                                             established_connections.write().await.add(id);
-                                            inbound_sender.send((id, Event::Connected)).await.unwrap();
+                                            inbound_sender.try_send((id, Event::Connected)).unwrap();
                                         }
                                     },
                                     Err(err) => {
@@ -128,7 +131,7 @@ impl Server {
                                             connections.remove(id as usize);
                                             established_connections.write().await.remove(id);
                                         }
-                                        inbound_sender.send((id, Event::Disconnected)).await.unwrap();
+                                        inbound_sender.try_send((id, Event::Disconnected)).unwrap();
                                         break;
                                     }
                                 }
@@ -152,7 +155,7 @@ impl Server {
                                 let mut connection_address = connection.address.lock().await;
                                 if is_connected && connection_address.map(|addr| addr == remote_address).unwrap_or(false) && connection.verify(data, tag) {
                                     // Verified sender, create event:
-                                    inbound_sender.send((id, Event::Received(data.to_vec()))).await.unwrap();
+                                    inbound_sender.try_send((id, Event::Received(data.to_vec()))).unwrap();
                                 } else if !is_connected && connection_address.is_none() && data == b"ACK" && connection.verify(data, tag) {
                                     // Handshake - Received UDP, respond with ACK (3):
                                     *connection_address = Some(remote_address);
@@ -162,7 +165,7 @@ impl Server {
                         }
                     }
                 },
-                result = outbound_receiver.recv() => {
+                result = outbound_receiver.next() => {
                     if let Some((id, mut data, delivery)) = result {
                         let is_connected = established_connections.read().await.contains(id);
                         if is_connected {

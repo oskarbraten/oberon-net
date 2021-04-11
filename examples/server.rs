@@ -1,5 +1,4 @@
 use anyhow::Result;
-use rcgen::generate_simple_self_signed;
 use tokio_rustls::rustls::{
     internal::pemfile::{certs, pkcs8_private_keys},
     NoClientAuth, ServerConfig,
@@ -12,30 +11,38 @@ async fn main() -> Result<()> {
 
     let address = "127.0.0.1:10000";
 
-    let generated_certificate = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-
     let config = {
         let mut config = ServerConfig::new(NoClientAuth::new());
-        let certificates = certs(&mut generated_certificate.serialize_pem()?.as_bytes()).unwrap();
 
-        let keys =
-            pkcs8_private_keys(&mut generated_certificate.serialize_private_key_pem().as_bytes())
-                .unwrap();
+        let certificates = {
+            let file = std::fs::File::open("./examples/certs/cert.pem")?;
+            let mut buffered = std::io::BufReader::new(file);
 
-        config.set_single_cert(certificates, keys[0].clone())?;
+            certs(&mut buffered).unwrap()
+        };
+
+        let key = {
+            let file = std::fs::File::open("./examples/certs/key.pem")?;
+            let mut buffered = std::io::BufReader::new(file);
+
+            pkcs8_private_keys(&mut buffered).unwrap()[0].clone()
+        };
+
+        config.set_single_cert(certificates, key)?;
         config
     };
 
-    let (sender, receiver, task) = Server::listen(address, Config::default(), config);
+    let (sender, mut receiver, task) = Server::listen(address, Config::default(), config);
 
     tokio::try_join!(
         tokio::spawn(async move {
+            println!("Listening on {}", address);
             task.await.unwrap();
         }),
         tokio::spawn(async move {
             loop {
                 match receiver.recv().await {
-                    Ok(event) => match event {
+                    Some(event) => match event {
                         (id, Event::Connected) => {
                             log::info!("SERVER: Client {}, connected!", id);
                         }
@@ -54,8 +61,8 @@ async fn main() -> Result<()> {
                             log::info!("SERVER: Client {}, disconnected!", id);
                         }
                     },
-                    Err(err) => {
-                        log::debug!("{}", err);
+                    None => {
+                        log::debug!("Receiver returned none.");
                         break;
                     }
                 }

@@ -1,6 +1,12 @@
+pub use futures::channel::mpsc::{
+    unbounded as channel, TryRecvError, TrySendError, UnboundedReceiver as InnerReceiver,
+    UnboundedSender as InnerSender,
+};
+
 use crate::{ConnectionId, Delivery};
+
 use thiserror::Error;
-use tokio::sync::mpsc::UnboundedSender;
+
 #[derive(Debug, Error)]
 pub enum SendError {
     #[error("Sender error: {0}")]
@@ -9,11 +15,11 @@ pub enum SendError {
 
 #[derive(Debug, Clone)]
 pub struct Sender<T> {
-    sender: UnboundedSender<T>,
+    sender: InnerSender<T>,
 }
 
 impl<T> Sender<T> {
-    pub fn new(sender: UnboundedSender<T>) -> Self {
+    pub fn new(sender: InnerSender<T>) -> Self {
         Self { sender }
     }
 }
@@ -22,7 +28,7 @@ impl<T> Sender<T> {
 impl Sender<(Vec<u8>, Delivery)> {
     pub fn send(&self, data: Vec<u8>, delivery: Delivery) -> Result<(), SendError> {
         self.sender
-            .send((data, delivery))
+            .unbounded_send((data, delivery))
             .map_err(|err| SendError::Send(err.to_string()))
     }
 
@@ -46,7 +52,7 @@ impl Sender<(ConnectionId, Vec<u8>, Delivery)> {
         delivery: Delivery,
     ) -> Result<(), SendError> {
         self.sender
-            .send((id, data, delivery))
+            .unbounded_send((id, data, delivery))
             .map_err(|err| SendError::Send(err.to_string()))
     }
 
