@@ -36,13 +36,11 @@ async fn main() -> Result<()> {
 
     let (sender, mut receiver, task) =
         Server::listen(address, Config::default(), config, move |token| {
-            let opt = if token == correct_token {
+            if token == correct_token {
                 Some("Hunter2")
             } else {
                 None
-            };
-
-            async move { opt }
+            }
         });
 
     tokio::try_join!(

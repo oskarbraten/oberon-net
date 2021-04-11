@@ -35,8 +35,7 @@ impl<'a> Server {
     pub fn listen<
         A: ToSocketAddrs,
         U: Send + Sync + Clone + 'static,
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
-        Fut: Future<Output = Option<U>> + Send + Sync + 'static,
+        F: Fn(Vec<u8>) -> Option<U> + Send + Sync + Clone + 'static,
     >(
         address: A,
         config: Config,
@@ -72,8 +71,7 @@ impl<'a> Server {
     async fn task<
         A: ToSocketAddrs,
         U: Send + Sync + Clone + 'static,
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Option<U>> + Send + Sync + 'static,
+        F: Fn(Vec<u8>) -> Option<U> + Send + Sync + Clone + 'static,
     >(
         address: A,
         config: Config,
@@ -145,7 +143,7 @@ impl<'a> Server {
 
                                             let token_data: Option<U> = {
                                                 let token = data[3..].to_vec();
-                                                validation_fn(token).await
+                                                validation_fn(token)
                                             };
 
                                             if let Some(token_data) = token_data {
