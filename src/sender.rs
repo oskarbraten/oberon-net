@@ -3,10 +3,7 @@ pub use futures::channel::mpsc::{
     UnboundedSender as InnerSender,
 };
 
-use crate::{ConnectionId, Delivery};
-
-pub type ServerSender = Sender<(ConnectionId, Vec<u8>, Delivery)>;
-pub type ClientSender = Sender<(Vec<u8>, Delivery)>;
+use crate::{ClientSender, ConnectionId, Delivery, ServerSender};
 
 use thiserror::Error;
 

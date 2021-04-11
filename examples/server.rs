@@ -36,11 +36,13 @@ async fn main() -> Result<()> {
 
     let (sender, mut receiver, task) =
         Server::listen(address, Config::default(), config, move |token| {
-            if token == correct_token {
-                Some(token)
+            let opt = if token == correct_token {
+                Some("Hunter2")
             } else {
                 None
-            }
+            };
+
+            async move { opt }
         });
 
     tokio::try_join!(
@@ -52,22 +54,22 @@ async fn main() -> Result<()> {
             loop {
                 match receiver.recv().await {
                     Some(event) => match event {
-                        (id, Event::Connected) => {
-                            log::info!("SERVER: Client {}, connected!", id);
+                        (id, Event::Connected, _info) => {
+                            println!("SERVER - Client {}, connected!", id);
                         }
-                        (id, Event::Received(data)) => {
-                            log::info!(
-                                "SERVER: received: {} (Connection id: {})",
-                                std::str::from_utf8(&data).unwrap(),
+                        (id, Event::Received(data), _info) => {
+                            println!(
+                                "SERVER - Received from client ({}): {}",
                                 id,
+                                std::str::from_utf8(&data).unwrap(),
                             );
 
                             let mut data = data;
-                            data.extend(b"- ECHO.");
+                            data.extend(b" - seen by server.");
                             sender.reliable(id, data).unwrap();
                         }
-                        (id, Event::Disconnected) => {
-                            log::info!("SERVER: Client {}, disconnected!", id);
+                        (id, Event::Disconnected, _info) => {
+                            println!("SERVER - Client {}, disconnected!", id);
                         }
                     },
                     None => {

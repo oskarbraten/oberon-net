@@ -23,6 +23,9 @@ use crate::{
 
 use futures::StreamExt;
 
+pub type ServerSender = Sender<(ConnectionId, Vec<u8>, Delivery)>;
+pub type ServerReceiver<U> = Receiver<(ConnectionId, Event, U)>;
+
 pub struct Server;
 
 impl<'a> Server {
@@ -31,26 +34,23 @@ impl<'a> Server {
     /// The server can run in a separate thread and messages/events can be sent/received in a synchronous context.
     pub fn listen<
         A: ToSocketAddrs,
-        #[cfg(feature = "token")] F: 'static,
-        #[cfg(feature = "token")] U: 'static,
+        U: Send + Sync + Clone + 'static,
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
+        Fut: Future<Output = Option<U>> + Send + Sync + 'static,
     >(
         address: A,
         config: Config,
         #[cfg(feature = "rustls")] server_config: ServerConfig,
-        #[cfg(feature = "token")] validation_fn: F,
+        validation_fn: F,
     ) -> (
         Sender<(ConnectionId, Vec<u8>, Delivery)>,
-        Receiver<(ConnectionId, Event)>,
+        Receiver<(ConnectionId, Event, U)>,
         impl Future<Output = Result<(), ServerError>>,
-    )
-    where
-        U: Send + Sync + Clone,
-        F: (Fn(Vec<u8>) -> Option<U>) + Send + Sync + Clone,
-    {
+    ) {
         let (outbound_sender, outbound_receiver) =
             sender::channel::<(ConnectionId, Vec<u8>, Delivery)>();
         let (inbound_sender, inbound_receiver) =
-            receiver::channel::<(ConnectionId, Event)>(config.event_capacity);
+            receiver::channel::<(ConnectionId, Event, U)>(config.event_capacity);
 
         let task = Self::task(
             address,
@@ -59,7 +59,6 @@ impl<'a> Server {
             outbound_receiver,
             #[cfg(feature = "rustls")]
             server_config,
-            #[cfg(feature = "token")]
             validation_fn,
         );
 
@@ -72,22 +71,18 @@ impl<'a> Server {
 
     async fn task<
         A: ToSocketAddrs,
-        #[cfg(feature = "token")] F: 'static,
-        #[cfg(feature = "token")] U: 'static,
+        U: Send + Sync + Clone + 'static,
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<U>> + Send + Sync + 'static,
     >(
         address: A,
         config: Config,
-        mut inbound_sender: receiver::InnerSender<(ConnectionId, Event)>,
+        mut inbound_sender: receiver::InnerSender<(ConnectionId, Event, U)>,
         mut outbound_receiver: sender::InnerReceiver<(ConnectionId, Vec<u8>, Delivery)>,
         #[cfg(feature = "rustls")] server_config: ServerConfig,
-        #[cfg(feature = "token")] validation_fn: F,
-    ) -> Result<(), ServerError>
-    where
-        U: Send + Sync + Clone,
-        F: (Fn(Vec<u8>) -> Option<U>) + Send + Sync + Clone,
-    {
-        // #[cfg(feature = "token")]
-        // let validation_fn = Arc::new(validation_fn);
+        validation_fn: F,
+    ) -> Result<(), ServerError> {
+        let validation_fn = Arc::new(validation_fn);
 
         let socket = UdpSocket::bind(&address).await?;
 
@@ -95,12 +90,6 @@ impl<'a> Server {
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
         let listener = TcpListener::bind(&address).await?;
-
-        // #[cfg(feature = "token")]
-        // let connections: Arc<RwLock<Slab<Connection<_, U>>>> = Arc::new(RwLock::new(Slab::new()));
-
-        // #[cfg(not(feature = "token"))]
-        // let connections: Arc<RwLock<Slab<Connection<_, ()>>>> = Arc::new(RwLock::new(Slab::new()));
 
         let connections = Arc::new(RwLock::new(Slab::new()));
         let established_connections = Arc::new(RwLock::new(BitSet::new()));
@@ -130,7 +119,8 @@ impl<'a> Server {
                             let entry = connections.vacant_entry();
 
                             let id = entry.key() as u32;
-                            let connection = Connection::accept(id, write_stream).await.unwrap();
+
+                            let connection = Connection::<_, U>::accept(id, write_stream).await.unwrap();
 
                             entry.insert(connection);
 
@@ -140,7 +130,6 @@ impl<'a> Server {
                         let connections = connections.clone();
                         let established_connections = established_connections.clone();
                         let mut inbound_sender = inbound_sender.clone();
-                        // #[cfg(feature = "token")]
                         let validation_fn = validation_fn.clone();
 
                         tokio::spawn(async move {
@@ -150,39 +139,42 @@ impl<'a> Server {
                                     Ok(data) => {
                                         let is_connected = established_connections.read().await.contains(id);
                                         if is_connected {
-                                            inbound_sender.try_send((id, Event::Received(data))).unwrap();
+                                            let info = connections.read().await.get(id as usize).map(|conn| conn.info.clone()).unwrap().unwrap();
+                                            inbound_sender.try_send((id, Event::Received(data), info)).unwrap();
                                         } else if &data[0..3] == b"ACK" {
 
-                                            #[cfg(feature = "token")]
-                                            let token_data = {
+                                            let token_data: Option<U> = {
                                                 let token = data[3..].to_vec();
-                                                validation_fn(token)
+                                                validation_fn(token).await
                                             };
-                                            #[cfg(feature = "token")]
-                                            if token_data.is_none() {
+
+                                            if let Some(token_data) = token_data {
+                                                let mut connections = connections.write().await;
+                                                let connection = connections.get_mut(id as usize).unwrap();
+
+                                                connection.info = Some(token_data.clone());
+
+                                                established_connections.write().await.add(id);
+                                                inbound_sender.try_send((id, Event::Connected, token_data)).unwrap();
+                                            } else {
                                                 // Token validation failed, remove and drop connection.
                                                 let mut connections = connections.write().await;
                                                 connections.remove(id as usize);
                                                 break;
-                                            } else {
-                                                let mut connections = connections.write().await;
-                                                let connection = connections.get_mut(id as usize).unwrap();
-
-                                                connection.data = Some(token_data);
                                             }
-
-                                            established_connections.write().await.add(id);
-                                            inbound_sender.try_send((id, Event::Connected)).unwrap();
                                         }
                                     },
                                     Err(err) => {
                                         log::debug!("Error reading frame (TCP): {:#?}", err);
-                                        {
+                                        let info = {
                                             let mut connections = connections.write().await;
+                                            let info = connections.get(id as usize).map(|conn| conn.info.clone()).unwrap().unwrap();
                                             connections.remove(id as usize);
                                             established_connections.write().await.remove(id);
-                                        }
-                                        inbound_sender.try_send((id, Event::Disconnected)).unwrap();
+
+                                            info
+                                        };
+                                        inbound_sender.try_send((id, Event::Disconnected, info)).unwrap();
                                         break;
                                     }
                                 }
@@ -206,7 +198,7 @@ impl<'a> Server {
                                 let mut connection_address = connection.address.lock().await;
                                 if is_connected && connection_address.map(|addr| addr == remote_address).unwrap_or(false) && connection.verify(data, tag) {
                                     // Verified sender, create event:
-                                    inbound_sender.try_send((id, Event::Received(data.to_vec()))).unwrap();
+                                    inbound_sender.try_send((id, Event::Received(data.to_vec()), connection.info.clone().unwrap())).unwrap();
                                 } else if !is_connected && connection_address.is_none() && data == b"ACK" && connection.verify(data, tag) {
                                     // Handshake - Received UDP, respond with ACK (3):
                                     *connection_address = Some(remote_address);

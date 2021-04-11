@@ -3,10 +3,6 @@ pub use futures::channel::mpsc::{
 };
 use futures::StreamExt;
 
-use crate::{ConnectionId, Event};
-pub type ServerReceiver = Receiver<(ConnectionId, Event)>;
-pub type ClientReceiver = Receiver<Event>;
-
 use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum RecvError {

@@ -28,6 +28,9 @@ pub enum ClientError {
     Event(#[from] receiver::TrySendError<Event>),
 }
 
+pub type ClientSender = Sender<(Vec<u8>, Delivery)>;
+pub type ClientReceiver = Receiver<Event>;
+
 pub struct Client;
 
 impl Client {
@@ -39,7 +42,7 @@ impl Client {
         config: Config,
         #[cfg(feature = "rustls")] domain: DNSName,
         #[cfg(feature = "rustls")] client_config: ClientConfig,
-        #[cfg(feature = "token")] token: Vec<u8>,
+        token: Vec<u8>,
     ) -> (
         Sender<(Vec<u8>, Delivery)>,
         Receiver<Event>,
@@ -51,14 +54,13 @@ impl Client {
         let task = Self::task(
             address,
             config,
-            inbound_sender,
-            outbound_receiver,
             #[cfg(feature = "rustls")]
             domain,
             #[cfg(feature = "rustls")]
             client_config,
-            #[cfg(feature = "token")]
             token,
+            inbound_sender,
+            outbound_receiver,
         );
 
         (
@@ -71,11 +73,11 @@ impl Client {
     async fn task<A: ToSocketAddrs>(
         address: A,
         config: Config,
-        mut inbound_sender: receiver::InnerSender<Event>,
-        mut outbound_receiver: sender::InnerReceiver<(Vec<u8>, Delivery)>,
         #[cfg(feature = "rustls")] domain: DNSName,
         #[cfg(feature = "rustls")] client_config: ClientConfig,
-        #[cfg(feature = "token")] token: Vec<u8>,
+        token: Vec<u8>,
+        mut inbound_sender: receiver::InnerSender<Event>,
+        mut outbound_receiver: sender::InnerReceiver<(Vec<u8>, Delivery)>,
     ) -> Result<(), ClientError> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(&address).await?;
@@ -93,14 +95,8 @@ impl Client {
             split(stream)
         };
 
-        let (id, connection) = Connection::connect(
-            &socket,
-            &mut read_stream,
-            write_stream,
-            #[cfg(feature = "token")]
-            token,
-        )
-        .await?;
+        let (id, connection) =
+            Connection::connect(&socket, &mut read_stream, write_stream, token).await?;
         inbound_sender.try_send(Event::Connected)?;
 
         let mut recv_buffer = [0u8; std::u16::MAX as usize];

@@ -36,8 +36,8 @@ mod server;
 
 pub use config::Config;
 
-pub use receiver::{ClientReceiver, Receiver, RecvError, ServerReceiver};
-pub use sender::{ClientSender, SendError, Sender, ServerSender};
+pub use receiver::{Receiver, RecvError};
+pub use sender::{SendError, Sender};
 
-pub use client::Client;
-pub use server::Server;
+pub use client::{Client, ClientReceiver, ClientSender};
+pub use server::{Server, ServerReceiver, ServerSender};

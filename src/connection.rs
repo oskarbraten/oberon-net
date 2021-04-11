@@ -29,7 +29,7 @@ pub struct Connection<T: AsyncRead + AsyncWrite, U = ()> {
     pub verify_mac: std::sync::Mutex<Cmac<Aes128>>,
     pub write_stream: Mutex<WriteHalf<T>>,
     pub address: Mutex<Option<SocketAddr>>,
-    pub data: Option<U>,
+    pub info: Option<U>,
 }
 
 impl<T> Connection<T, ()>
@@ -40,7 +40,7 @@ where
         socket: &UdpSocket,
         read_stream: &mut ReadHalf<T>,
         mut write_stream: WriteHalf<T>,
-        #[cfg(feature = "token")] token: Vec<u8>,
+        token: Vec<u8>,
     ) -> Result<(u32, Self), ConnectionError> {
         let data = Self::read(read_stream, 2500).await?;
 
@@ -87,22 +87,12 @@ where
             }
         }
 
-        #[cfg(feature = "token")]
-        {
-            // Handshake - Send final reliable ACK and token (3):
-            write_stream
-                .write_u32((b"ACK".len() + token.len()) as u32)
-                .await?;
-            write_stream.write(b"ACK").await?;
-            write_stream.write(&token).await?;
-        }
-
-        #[cfg(not(feature = "token"))]
-        {
-            // Handshake - Send final reliable ACK (3):
-            write_stream.write_u32(b"ACK".len() as u32).await?;
-            write_stream.write(b"ACK").await?;
-        }
+        // Handshake - Send final reliable ACK and token (3):
+        write_stream
+            .write_u32((b"ACK".len() + token.len()) as u32)
+            .await?;
+        write_stream.write(b"ACK").await?;
+        write_stream.write(&token).await?;
 
         Ok((
             id,
@@ -112,7 +102,7 @@ where
                 verify_mac: std::sync::Mutex::new(verify_mac),
                 write_stream: Mutex::new(write_stream),
                 address: Mutex::new(None),
-                data: None,
+                info: None,
             },
         ))
     }
@@ -142,7 +132,7 @@ where
             verify_mac: std::sync::Mutex::new(verify_mac),
             write_stream: Mutex::new(write_stream),
             address: Mutex::new(None),
-            data: None,
+            info: None,
         })
     }
 

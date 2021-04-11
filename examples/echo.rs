@@ -58,11 +58,13 @@ fn main() -> Result<()> {
             let correct_token = b"TOKEN".to_vec();
             let (server_sender, mut server_receiver, server_task) =
                 Server::listen(address, Config::default(), server_config, move |token| {
-                    if token == correct_token {
-                        Some(token)
+                    let opt = if token == correct_token {
+                        Some("Hunter2")
                     } else {
                         None
-                    }
+                    };
+
+                    async move { opt }
                 });
             let (r1, r2) = tokio::join!(
                 tokio::spawn(server_task),
@@ -70,10 +72,10 @@ fn main() -> Result<()> {
                     loop {
                         match server_receiver.recv().await {
                             Some(event) => match event {
-                                (id, Event::Connected) => {
+                                (id, Event::Connected, _info) => {
                                     log::info!("SERVER: Client {}, connected!", id);
                                 }
-                                (id, Event::Received(data)) => {
+                                (id, Event::Received(data), _info) => {
                                     log::info!(
                                         "SERVER: received: {} (Connection id: {})",
                                         std::str::from_utf8(&data).unwrap(),
@@ -84,7 +86,7 @@ fn main() -> Result<()> {
                                     data.extend(b"- ECHO.");
                                     server_sender.reliable(id, data).unwrap();
                                 }
-                                (id, Event::Disconnected) => {
+                                (id, Event::Disconnected, _info) => {
                                     log::info!("SERVER: Client {}, disconnected!", id);
                                 }
                             },
