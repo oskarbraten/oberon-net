@@ -1,4 +1,9 @@
-use anyhow::Result;
+use thiserror::Error;
+#[derive(Debug, Error)]
+pub enum RecvError {
+    #[error("Receiver error: {0}")]
+    Recv(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct Receiver<T> {
@@ -11,12 +16,17 @@ impl<T> Receiver<T> {
     }
 
     /// Asynchronously receive an event.
-    pub async fn recv(&self) -> Result<T> {
-        self.receiver.recv().await.map_err(|err| err.into())
+    pub async fn recv(&self) -> Result<T, RecvError> {
+        self.receiver
+            .recv()
+            .await
+            .map_err(|err| RecvError::Recv(err.to_string()))
     }
 
     /// Attempts to receive an event. This function is non-blocking.
-    pub fn try_recv(&self) -> Result<T> {
-        self.receiver.try_recv().map_err(|err| err.into())
+    pub fn try_recv(&self) -> Result<T, RecvError> {
+        self.receiver
+            .try_recv()
+            .map_err(|err| RecvError::Recv(err.to_string()))
     }
 }

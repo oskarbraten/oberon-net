@@ -1,4 +1,3 @@
-use anyhow::Result;
 use hibitset::BitSet;
 use slab::Slab;
 use std::{convert::TryInto, future::Future, sync::Arc};
@@ -11,6 +10,13 @@ use tokio::{
 
 #[cfg(feature = "rustls")]
 use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+
+use thiserror::Error;
+#[derive(Debug, Error)]
+pub enum ServerError {
+    #[error("Unable to create server.")]
+    Io(#[from] std::io::Error),
+}
 
 use crate::{Config, Connection, ConnectionId, Delivery, Event, Receiver, Sender};
 
@@ -27,7 +33,7 @@ impl Server {
     ) -> (
         Sender<(ConnectionId, Vec<u8>, Delivery)>,
         Receiver<(ConnectionId, Event)>,
-        impl Future<Output = Result<(), anyhow::Error>>,
+        impl Future<Output = Result<(), ServerError>>,
     ) {
         let (outbound_sender, outbound_receiver) =
             mpsc::unbounded_channel::<(ConnectionId, Vec<u8>, Delivery)>();
@@ -56,7 +62,7 @@ impl Server {
         inbound_sender: async_channel::Sender<(ConnectionId, Event)>,
         mut outbound_receiver: mpsc::UnboundedReceiver<(ConnectionId, Vec<u8>, Delivery)>,
         #[cfg(feature = "rustls")] server_config: ServerConfig,
-    ) -> Result<()> {
+    ) -> Result<(), ServerError> {
         let socket = UdpSocket::bind(&address).await?;
 
         #[cfg(feature = "rustls")]

@@ -1,7 +1,11 @@
-use anyhow::Result;
-use tokio::sync::mpsc::UnboundedSender;
-
 use crate::{ConnectionId, Delivery};
+use thiserror::Error;
+use tokio::sync::mpsc::UnboundedSender;
+#[derive(Debug, Error)]
+pub enum SendError {
+    #[error("Sender error: {0}")]
+    Send(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct Sender<T> {
@@ -16,36 +20,43 @@ impl<T> Sender<T> {
 
 /// # Sender used for Client
 impl Sender<(Vec<u8>, Delivery)> {
-    pub fn send(&self, data: Vec<u8>, delivery: Delivery) -> Result<()> {
-        self.sender.send((data, delivery)).map_err(|err| err.into())
+    pub fn send(&self, data: Vec<u8>, delivery: Delivery) -> Result<(), SendError> {
+        self.sender
+            .send((data, delivery))
+            .map_err(|err| SendError::Send(err.to_string()))
     }
 
     /// Send data to the server with reliable delivery.
-    pub fn reliable(&self, data: Vec<u8>) -> Result<()> {
+    pub fn reliable(&self, data: Vec<u8>) -> Result<(), SendError> {
         self.send(data, Delivery::Reliable)
     }
 
     /// Send data to the server with unreliable delivery.
-    pub fn unreliable(&self, data: Vec<u8>) -> Result<()> {
+    pub fn unreliable(&self, data: Vec<u8>) -> Result<(), SendError> {
         self.send(data, Delivery::Unreliable)
     }
 }
 
 /// # Sender used for Server
 impl Sender<(ConnectionId, Vec<u8>, Delivery)> {
-    pub fn send(&self, id: ConnectionId, data: Vec<u8>, delivery: Delivery) -> Result<()> {
+    pub fn send(
+        &self,
+        id: ConnectionId,
+        data: Vec<u8>,
+        delivery: Delivery,
+    ) -> Result<(), SendError> {
         self.sender
             .send((id, data, delivery))
-            .map_err(|err| err.into())
+            .map_err(|err| SendError::Send(err.to_string()))
     }
 
     /// Send data to a client with reliable delivery.
-    pub fn reliable(&self, id: ConnectionId, data: Vec<u8>) -> Result<()> {
+    pub fn reliable(&self, id: ConnectionId, data: Vec<u8>) -> Result<(), SendError> {
         self.send(id, data, Delivery::Reliable)
     }
 
     /// Send data to a client with unreliable delivery.
-    pub fn unreliable(&self, id: ConnectionId, data: Vec<u8>) -> Result<()> {
+    pub fn unreliable(&self, id: ConnectionId, data: Vec<u8>) -> Result<(), SendError> {
         self.send(id, data, Delivery::Unreliable)
     }
 }

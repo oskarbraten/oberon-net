@@ -1,8 +1,8 @@
 use aes::Aes128;
-use anyhow::Result;
 use cmac::{Cmac, Mac, NewMac};
 use rand::RngCore;
 use std::{convert::TryInto, net::SocketAddr};
+
 use tokio::{
     io,
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
@@ -10,6 +10,17 @@ use tokio::{
     sync::Mutex,
     time::{sleep, Duration},
 };
+
+use thiserror::Error;
+#[derive(Debug, Error)]
+pub enum ConnectionError {
+    #[error("Unable to create client.")]
+    Io(#[from] std::io::Error),
+    #[error("Unable to create Mac: {0}")]
+    FailedToCreateMac(String),
+    #[error("Client received invalid handshake message: {0}")]
+    InvalidHandshake(&'static str),
+}
 
 #[derive(Debug)]
 pub struct Connection<T: AsyncRead + AsyncWrite> {
@@ -28,15 +39,22 @@ where
         socket: &UdpSocket,
         read_stream: &mut ReadHalf<T>,
         mut write_stream: WriteHalf<T>,
-    ) -> Result<(u32, Self)> {
+    ) -> Result<(u32, Self), ConnectionError> {
         let data = Self::read(read_stream, 2500).await?;
-        let id = u32::from_be_bytes(data[0..4].try_into()?);
-        let key: [u8; 16] = data[4..20].try_into()?;
 
-        let mut sign_mac =
-            Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
-        let verify_mac =
-            Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
+        let id = u32::from_be_bytes(
+            data[0..4]
+                .try_into()
+                .map_err(|_| ConnectionError::InvalidHandshake("Missing id."))?,
+        );
+        let key: [u8; 16] = data[4..20]
+            .try_into()
+            .map_err(|_| ConnectionError::InvalidHandshake("Missing key."))?;
+
+        let mut sign_mac = Cmac::<Aes128>::new_varkey(&key)
+            .map_err(|err| ConnectionError::FailedToCreateMac(err.to_string()))?;
+        let verify_mac = Cmac::<Aes128>::new_varkey(&key)
+            .map_err(|err| ConnectionError::FailedToCreateMac(err.to_string()))?;
 
         let tag: [u8; 8] = {
             sign_mac.update(b"ACK");
@@ -84,14 +102,14 @@ where
         ))
     }
 
-    pub async fn accept(id: u32, mut write_stream: WriteHalf<T>) -> Result<Self> {
+    pub async fn accept(id: u32, mut write_stream: WriteHalf<T>) -> Result<Self, ConnectionError> {
         let mut key = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut key);
 
-        let sign_mac =
-            Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
-        let verify_mac =
-            Cmac::<Aes128>::new_varkey(&key).map_err(|err| anyhow::anyhow!("{}", err))?;
+        let sign_mac = Cmac::<Aes128>::new_varkey(&key)
+            .map_err(|err| ConnectionError::FailedToCreateMac(format!("{}", err)))?;
+        let verify_mac = Cmac::<Aes128>::new_varkey(&key)
+            .map_err(|err| ConnectionError::FailedToCreateMac(format!("{}", err)))?;
 
         // Handshake - Initiate (1):
         write_stream.write_u32(4 + key.len() as u32).await?; // Connection id (u32) size + Key size

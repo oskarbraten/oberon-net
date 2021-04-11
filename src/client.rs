@@ -1,4 +1,3 @@
-use anyhow::Result;
 use std::future::Future;
 use tokio::{
     io::split,
@@ -12,7 +11,18 @@ use tokio_rustls::{rustls::ClientConfig, webpki::DNSName, TlsConnector};
 #[cfg(feature = "rustls")]
 use std::sync::Arc;
 
-use crate::{Config, Connection, Delivery, Event, Receiver, Sender};
+use crate::{connection::ConnectionError, Config, Connection, Delivery, Event, Receiver, Sender};
+
+use thiserror::Error;
+#[derive(Debug, Error)]
+pub enum ClientError {
+    #[error("Unable to create client.")]
+    Io(#[from] std::io::Error),
+    #[error("Unable to establish connection.")]
+    Connection(#[from] ConnectionError),
+    #[error("Unable to send message.")]
+    Send(#[from] async_channel::SendError<Event>),
+}
 
 pub struct Client;
 
@@ -28,7 +38,7 @@ impl Client {
     ) -> (
         Sender<(Vec<u8>, Delivery)>,
         Receiver<Event>,
-        impl Future<Output = Result<(), anyhow::Error>>,
+        impl Future<Output = Result<(), ClientError>>,
     ) {
         let (outbound_sender, outbound_receiver) = mpsc::unbounded_channel::<(Vec<u8>, Delivery)>();
         let (inbound_sender, inbound_receiver) =
@@ -59,7 +69,7 @@ impl Client {
         mut outbound_receiver: mpsc::UnboundedReceiver<(Vec<u8>, Delivery)>,
         #[cfg(feature = "rustls")] domain: DNSName,
         #[cfg(feature = "rustls")] client_config: ClientConfig,
-    ) -> Result<()> {
+    ) -> Result<(), ClientError> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(&address).await?;
 
