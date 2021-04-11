@@ -3,13 +3,17 @@ pub use futures::channel::mpsc::{
 };
 use futures::StreamExt;
 
+use crate::{ConnectionId, Event};
+pub type ServerReceiver = Receiver<(ConnectionId, Event)>;
+pub type ClientReceiver = Receiver<Event>;
+
 use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum RecvError {
-    #[error("Receiver error: {0}")]
-    Recv(#[from] TryRecvError),
-    #[error("Receiver is empty and closed.")]
-    Closed,
+    #[error("No messages available.")]
+    Empty,
+    #[error("The receiver is empty and disconnected.")]
+    Disconnected,
 }
 
 #[derive(Debug)]
@@ -22,7 +26,7 @@ impl<T> Receiver<T> {
         Self { receiver }
     }
 
-    /// Asynchronously receive an event.
+    /// Asynchronously receive an event, returns [`None`] when the receiver is empty and disconnected.
     pub async fn recv(&mut self) -> Option<T> {
         self.receiver.next().await
     }
@@ -31,8 +35,8 @@ impl<T> Receiver<T> {
     pub fn try_recv(&mut self) -> Result<T, RecvError> {
         match self.receiver.try_next() {
             Ok(Some(t)) => Ok(t),
-            Ok(None) => Err(RecvError::Closed),
-            Err(err) => Err(err.into()),
+            Ok(None) => Err(RecvError::Disconnected),
+            Err(_) => Err(RecvError::Empty),
         }
     }
 }

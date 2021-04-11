@@ -5,12 +5,17 @@ pub use futures::channel::mpsc::{
 
 use crate::{ConnectionId, Delivery};
 
+pub type ServerSender = Sender<(ConnectionId, Vec<u8>, Delivery)>;
+pub type ClientSender = Sender<(Vec<u8>, Delivery)>;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SendError {
-    #[error("Sender error: {0}")]
-    Send(String),
+    #[error("The sender is full.")]
+    Full,
+    #[error("The sender is disconnected.")]
+    Disconnected,
 }
 
 #[derive(Debug, Clone)]
@@ -25,11 +30,15 @@ impl<T> Sender<T> {
 }
 
 /// # Sender used for Client
-impl Sender<(Vec<u8>, Delivery)> {
+impl ClientSender {
     pub fn send(&self, data: Vec<u8>, delivery: Delivery) -> Result<(), SendError> {
-        self.sender
-            .unbounded_send((data, delivery))
-            .map_err(|err| SendError::Send(err.to_string()))
+        self.sender.unbounded_send((data, delivery)).map_err(|err| {
+            if err.is_full() {
+                SendError::Full
+            } else {
+                SendError::Disconnected
+            }
+        })
     }
 
     /// Send data to the server with reliable delivery.
@@ -44,7 +53,7 @@ impl Sender<(Vec<u8>, Delivery)> {
 }
 
 /// # Sender used for Server
-impl Sender<(ConnectionId, Vec<u8>, Delivery)> {
+impl ServerSender {
     pub fn send(
         &self,
         id: ConnectionId,
@@ -53,7 +62,13 @@ impl Sender<(ConnectionId, Vec<u8>, Delivery)> {
     ) -> Result<(), SendError> {
         self.sender
             .unbounded_send((id, data, delivery))
-            .map_err(|err| SendError::Send(err.to_string()))
+            .map_err(|err| {
+                if err.is_full() {
+                    SendError::Full
+                } else {
+                    SendError::Disconnected
+                }
+            })
     }
 
     /// Send data to a client with reliable delivery.
