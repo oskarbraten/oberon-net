@@ -1,7 +1,13 @@
+use futures::StreamExt;
 use std::future::Future;
+use thiserror::Error;
 use tokio::{
     io::split,
     net::{TcpStream, ToSocketAddrs, UdpSocket},
+};
+
+use crate::{
+    connection::ConnectionError, receiver, sender, Config, Connection, Delivery, Receiver, Sender,
 };
 
 #[cfg(feature = "rustls")]
@@ -10,14 +16,13 @@ use tokio_rustls::{rustls::ClientConfig, webpki::DNSName, TlsConnector};
 #[cfg(feature = "rustls")]
 use std::sync::Arc;
 
-use crate::{
-    connection::ConnectionError, receiver, sender, Config, Connection, Delivery, Event, Receiver,
-    Sender,
-};
+#[derive(Debug, Clone)]
+pub enum ClientEvent {
+    Connected,
+    Received(Vec<u8>),
+    Disconnected,
+}
 
-use futures::StreamExt;
-
-use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("Unable to create client.")]
@@ -25,11 +30,11 @@ pub enum ClientError {
     #[error("Unable to establish connection.")]
     Connection(#[from] ConnectionError),
     #[error("Unable to dispatch event.")]
-    Event(#[from] receiver::TrySendError<Event>),
+    Event(#[from] receiver::TrySendError<ClientEvent>),
 }
 
 pub type ClientSender = Sender<(Vec<u8>, Delivery)>;
-pub type ClientReceiver = Receiver<Event>;
+pub type ClientReceiver = Receiver<ClientEvent>;
 
 pub struct Client;
 
@@ -45,11 +50,12 @@ impl Client {
         token: Vec<u8>,
     ) -> (
         Sender<(Vec<u8>, Delivery)>,
-        Receiver<Event>,
+        Receiver<ClientEvent>,
         impl Future<Output = Result<(), ClientError>>,
     ) {
         let (outbound_sender, outbound_receiver) = sender::channel::<(Vec<u8>, Delivery)>();
-        let (inbound_sender, inbound_receiver) = receiver::channel::<Event>(config.event_capacity);
+        let (inbound_sender, inbound_receiver) =
+            receiver::channel::<ClientEvent>(config.event_capacity);
 
         let task = Self::task(
             address,
@@ -76,7 +82,7 @@ impl Client {
         #[cfg(feature = "rustls")] domain: DNSName,
         #[cfg(feature = "rustls")] client_config: ClientConfig,
         token: Vec<u8>,
-        mut inbound_sender: receiver::InnerSender<Event>,
+        mut inbound_sender: receiver::InnerSender<ClientEvent>,
         mut outbound_receiver: sender::InnerReceiver<(Vec<u8>, Delivery)>,
     ) -> Result<(), ClientError> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -97,7 +103,7 @@ impl Client {
 
         let (id, connection) =
             Connection::connect(&socket, &mut read_stream, write_stream, token).await?;
-        inbound_sender.try_send(Event::Connected)?;
+        inbound_sender.try_send(ClientEvent::Connected)?;
 
         let mut recv_buffer = [0u8; std::u16::MAX as usize];
         loop {
@@ -105,11 +111,11 @@ impl Client {
                 result = Connection::read(&mut read_stream, config.max_reliable_size) => {
                     match result {
                         Ok(data) => {
-                            inbound_sender.try_send(Event::Received(data))?;
+                            inbound_sender.try_send(ClientEvent::Received(data))?;
                         },
                         Err(err) => {
                             log::debug!("Error reading frame (TCP): {:#?}", err);
-                            inbound_sender.try_send(Event::Disconnected)?;
+                            inbound_sender.try_send(ClientEvent::Disconnected)?;
                             return Err(err.into());
                         }
                     }
@@ -122,7 +128,7 @@ impl Client {
                             let data = &recv_buffer[8..bytes_read];
 
                             if connection.verify(data, tag) {
-                                inbound_sender.try_send(Event::Received(data.to_vec()))?;
+                                inbound_sender.try_send(ClientEvent::Received(data.to_vec()))?;
                             }
                         }
                     }

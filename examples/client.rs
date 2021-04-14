@@ -2,7 +2,7 @@ use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_rustls::{rustls::ClientConfig, webpki::DNSNameRef};
 
-use zelda::{Client, Config, Event};
+use zelda::{Client, ClientEvent, Config};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
     loop {
         match receiver.recv().await {
             Some(event) => match event {
-                Event::Connected => {
+                ClientEvent::Connected => {
                     println!("Connected to server!");
 
                     let sender = sender.clone();
@@ -74,13 +74,13 @@ async fn main() -> Result<()> {
                         }
                     });
                 }
-                Event::Received(data) => {
+                ClientEvent::Received(data) => {
                     println!(
                         "Received from server: {}",
                         std::str::from_utf8(&data).unwrap()
                     );
                 }
-                Event::Disconnected => {
+                ClientEvent::Disconnected => {
                     println!("Disconnected from server!");
                 }
             },

@@ -23,16 +23,15 @@ pub enum ConnectionError {
 }
 
 #[derive(Debug)]
-pub struct Connection<T: AsyncRead + AsyncWrite, U = ()> {
+pub struct Connection<T: AsyncRead + AsyncWrite> {
     pub key: [u8; 16],
     pub sign_mac: std::sync::Mutex<Cmac<Aes128>>,
     pub verify_mac: std::sync::Mutex<Cmac<Aes128>>,
     pub write_stream: Mutex<WriteHalf<T>>,
     pub address: Mutex<Option<SocketAddr>>,
-    pub info: Option<U>,
 }
 
-impl<T> Connection<T, ()>
+impl<T> Connection<T>
 where
     T: AsyncRead + AsyncWrite,
 {
@@ -102,16 +101,10 @@ where
                 verify_mac: std::sync::Mutex::new(verify_mac),
                 write_stream: Mutex::new(write_stream),
                 address: Mutex::new(None),
-                info: None,
             },
         ))
     }
-}
 
-impl<T, U> Connection<T, U>
-where
-    T: AsyncRead + AsyncWrite,
-{
     pub async fn accept(id: u32, mut write_stream: WriteHalf<T>) -> Result<Self, ConnectionError> {
         let mut key = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut key);
@@ -132,7 +125,6 @@ where
             verify_mac: std::sync::Mutex::new(verify_mac),
             write_stream: Mutex::new(write_stream),
             address: Mutex::new(None),
-            info: None,
         })
     }
 
@@ -167,12 +159,7 @@ where
             .try_into()
             .unwrap()
     }
-}
 
-impl<T> Connection<T>
-where
-    T: AsyncRead + AsyncWrite,
-{
     pub async fn read(read_stream: &mut ReadHalf<T>, max_size: u32) -> io::Result<Vec<u8>> {
         let frame_size = {
             let mut bytes = [0; 4];

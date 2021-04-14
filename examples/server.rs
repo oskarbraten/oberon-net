@@ -3,7 +3,7 @@ use tokio_rustls::rustls::{
     internal::pemfile::{certs, pkcs8_private_keys},
     NoClientAuth, ServerConfig,
 };
-use zelda::{Config, Event, Server};
+use zelda::{Config, Server, ServerEvent};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -52,10 +52,10 @@ async fn main() -> Result<()> {
             loop {
                 match receiver.recv().await {
                     Some(event) => match event {
-                        (id, Event::Connected, _info) => {
+                        ServerEvent::Connected { id, claim: _ } => {
                             println!("SERVER - Client {}, connected!", id);
                         }
-                        (id, Event::Received(data), _info) => {
+                        ServerEvent::Received { id, data } => {
                             println!(
                                 "SERVER - Received from client ({}): {}",
                                 id,
@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
                             data.extend(b" - seen by server.");
                             sender.reliable(id, data).unwrap();
                         }
-                        (id, Event::Disconnected, _info) => {
+                        ServerEvent::Disconnected { id } => {
                             println!("SERVER - Client {}, disconnected!", id);
                         }
                     },

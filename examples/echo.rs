@@ -7,7 +7,7 @@ use tokio_rustls::{
     },
     webpki::DNSNameRef,
 };
-use zelda::{Client, Config, Event, Server};
+use zelda::{Client, ClientEvent, Config, Server, ServerEvent};
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -70,22 +70,22 @@ fn main() -> Result<()> {
                     loop {
                         match server_receiver.recv().await {
                             Some(event) => match event {
-                                (id, Event::Connected, _info) => {
-                                    log::info!("SERVER: Client {}, connected!", id);
+                                ServerEvent::Connected { id, claim } => {
+                                    println!("SERVER - Client {}, connected! Claim: {}", id, claim);
                                 }
-                                (id, Event::Received(data), _info) => {
-                                    log::info!(
-                                        "SERVER: received: {} (Connection id: {})",
-                                        std::str::from_utf8(&data).unwrap(),
+                                ServerEvent::Received { id, data } => {
+                                    println!(
+                                        "SERVER - Received from client ({}): {}",
                                         id,
+                                        std::str::from_utf8(&data).unwrap(),
                                     );
 
                                     let mut data = data;
-                                    data.extend(b"- ECHO.");
+                                    data.extend(b" - seen by server.");
                                     server_sender.reliable(id, data).unwrap();
                                 }
-                                (id, Event::Disconnected, _info) => {
-                                    log::info!("SERVER: Client {}, disconnected!", id);
+                                ServerEvent::Disconnected { id } => {
+                                    println!("SERVER - Client {}, disconnected!", id);
                                 }
                             },
                             None => {
@@ -131,7 +131,7 @@ fn main() -> Result<()> {
                     loop {
                         match client_receiver.recv().await {
                             Some(event) => match event {
-                                Event::Connected => {
+                                ClientEvent::Connected => {
                                     log::info!("CLIENT: Connected to server!");
 
                                     let client_sender = client_sender.clone();
@@ -150,13 +150,13 @@ fn main() -> Result<()> {
                                         }
                                     });
                                 }
-                                Event::Received(data) => {
+                                ClientEvent::Received(data) => {
                                     log::info!(
                                         "CLIENT: Received from server: {}",
                                         std::str::from_utf8(&data).unwrap()
                                     );
                                 }
-                                Event::Disconnected => {
+                                ClientEvent::Disconnected => {
                                     log::info!("CLIENT: Disconnected from server!");
                                 }
                             },
