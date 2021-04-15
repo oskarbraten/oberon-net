@@ -56,7 +56,7 @@ fn main() -> Result<()> {
             .unwrap();
         runtime.block_on(async {
             let correct_token = b"TOKEN".to_vec();
-            let (server_sender, mut server_receiver, server_task) =
+            let (server_sender, mut server_receiver, _, server_task) =
                 Server::listen(address, Config::default(), server_config, move |token| {
                     if token == correct_token {
                         Some("Hunter2")

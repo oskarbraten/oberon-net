@@ -4,7 +4,7 @@ use slab::Slab;
 use std::{convert::TryInto, future::Future, sync::Arc};
 use thiserror::Error;
 use tokio::{
-    io::split,
+    io::{split, AsyncWriteExt},
     net::{TcpListener, ToSocketAddrs, UdpSocket},
     sync::RwLock,
 };
@@ -30,6 +30,8 @@ pub enum ServerError {
 pub type ServerSender = Sender<(ConnectionId, Vec<u8>, Delivery)>;
 pub type ServerReceiver<U> = Receiver<ServerEvent<U>>;
 
+pub use crate::disconnector::{DisconnectError, Disconnector};
+
 pub struct Server;
 
 impl<'a> Server {
@@ -48,8 +50,10 @@ impl<'a> Server {
     ) -> (
         Sender<(ConnectionId, Vec<u8>, Delivery)>,
         Receiver<ServerEvent<U>>,
+        Disconnector,
         impl Future<Output = Result<(), ServerError>>,
     ) {
+        let (disconnect_sender, disconnect_receiver) = sender::channel::<ConnectionId>();
         let (outbound_sender, outbound_receiver) =
             sender::channel::<(ConnectionId, Vec<u8>, Delivery)>();
         let (inbound_sender, inbound_receiver) =
@@ -60,6 +64,7 @@ impl<'a> Server {
             config,
             inbound_sender,
             outbound_receiver,
+            disconnect_receiver,
             #[cfg(feature = "rustls")]
             server_config,
             validation_fn,
@@ -68,6 +73,7 @@ impl<'a> Server {
         (
             Sender::new(outbound_sender),
             Receiver::new(inbound_receiver),
+            Disconnector::new(disconnect_sender),
             task,
         )
     }
@@ -81,6 +87,7 @@ impl<'a> Server {
         config: Config,
         mut inbound_sender: receiver::InnerSender<ServerEvent<U>>,
         mut outbound_receiver: sender::InnerReceiver<(ConnectionId, Vec<u8>, Delivery)>,
+        mut disconnect_receiver: sender::InnerReceiver<ConnectionId>,
         #[cfg(feature = "rustls")] server_config: ServerConfig,
         validation_fn: F,
     ) -> Result<(), ServerError> {
@@ -228,6 +235,17 @@ impl<'a> Server {
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                },
+                result = disconnect_receiver.next() => {
+                    if let Some(id) = result {
+                        let mut connections = connections.write().await;
+                        if let Some(connection) = connections.get_mut(id as usize) {
+                            match connection.write_stream.lock().await.shutdown().await {
+                                Ok(_) => {},
+                                Err(err) => log::error!("Disconnector error: {}", err)
                             }
                         }
                     }

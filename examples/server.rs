@@ -5,6 +5,8 @@ use tokio_rustls::rustls::{
 };
 use zelda::{Config, Server, ServerEvent};
 
+use std::time::Duration;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -34,7 +36,7 @@ async fn main() -> Result<()> {
 
     let correct_token = b"TOKEN".to_vec();
 
-    let (sender, mut receiver, task) =
+    let (sender, mut receiver, disconnector, task) =
         Server::listen(address, Config::default(), config, move |token| {
             if token == correct_token {
                 Some("Hunter2")
@@ -54,6 +56,12 @@ async fn main() -> Result<()> {
                     Some(event) => match event {
                         ServerEvent::Connected { id, claim: _ } => {
                             println!("SERVER - Client {}, connected!", id);
+
+                            let disconnector = disconnector.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(60)).await;
+                                let _ = disconnector.disconnect(id);
+                            });
                         }
                         ServerEvent::Received { id, data } => {
                             println!(

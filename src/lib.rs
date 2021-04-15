@@ -24,6 +24,7 @@ pub type ConnectionId = u32;
 
 mod client;
 mod config;
+mod disconnector;
 mod receiver;
 mod sender;
 mod server;
