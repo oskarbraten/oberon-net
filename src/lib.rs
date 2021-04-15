@@ -35,4 +35,6 @@ pub use receiver::{Receiver, RecvError};
 pub use sender::{SendError, Sender};
 
 pub use client::{Client, ClientEvent, ClientReceiver, ClientSender};
-pub use server::{Server, ServerEvent, ServerReceiver, ServerSender};
+pub use server::{
+    DisconnectError, Disconnector, Server, ServerEvent, ServerReceiver, ServerSender,
+};
